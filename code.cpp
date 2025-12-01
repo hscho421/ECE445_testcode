@@ -23,8 +23,8 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 // Button debouncing and press detection
 unsigned long lastDebounceTime[2] = {0, 0};
 const unsigned long debounceDelay = 50;
-bool lastButtonState[2] = {HIGH, HIGH};
-bool buttonState[2] = {HIGH, HIGH};
+bool lastButtonState[2] = {LOW, LOW};
+bool buttonState[2] = {LOW, LOW};
 unsigned long buttonPressStart[2] = {0, 0};
 bool buttonLongPressTriggered[2] = {false, false};
 
@@ -757,58 +757,52 @@ void updateTuningScreen(float freq, const String& note, int cents) {
 // ===== BUTTON HANDLING (2-BUTTON SYSTEM) =====
 
 void initButtons() {
-  pinMode(BTN_TOGGLE, INPUT_PULLUP);
-  pinMode(BTN_SELECT, INPUT_PULLUP);
+  pinMode(BTN_TOGGLE, INPUT);
+  pinMode(BTN_SELECT, INPUT);
 }
 
-// Enhanced button reading with long press detection
 bool readButton(int buttonIndex, int pin, bool &longPress, bool &veryLongPress) {
-  bool reading = digitalRead(pin);
+  bool reading = digitalRead(pin);  // HIGH = pressed, LOW = released
   longPress = false;
   veryLongPress = false;
   
-  if (reading != lastButtonState[buttonIndex]) {
-    lastDebounceTime[buttonIndex] = millis();
-    if (reading == LOW) {
-      buttonPressStart[buttonIndex] = millis();
-      buttonLongPressTriggered[buttonIndex] = false;
-    }
+  // Detect press start (LOW -> HIGH transition)
+  if (reading == HIGH && lastButtonState[buttonIndex] == LOW) {
+    buttonPressStart[buttonIndex] = millis();
+    buttonLongPressTriggered[buttonIndex] = false;
   }
   
   bool pressed = false;
-  unsigned long pressDuration = 0;
   
-  if ((millis() - lastDebounceTime[buttonIndex]) > debounceDelay) {
-    if (reading != buttonState[buttonIndex]) {
-      buttonState[buttonIndex] = reading;
-      
-      if (buttonState[buttonIndex] == HIGH && lastButtonState[buttonIndex] == LOW) {
-        pressDuration = millis() - buttonPressStart[buttonIndex];
-        
-        if (pressDuration >= 2000 && !buttonLongPressTriggered[buttonIndex]) {
-          veryLongPress = true;
-          pressed = true;
-        } else if (pressDuration >= 800 && !buttonLongPressTriggered[buttonIndex]) {
-          longPress = true;
-          pressed = true;
-        } else if (pressDuration < 800) {
-          pressed = true;
-        }
+  // Detect release (HIGH -> LOW transition)
+  if (reading == LOW && lastButtonState[buttonIndex] == HIGH) {
+    unsigned long pressDuration = millis() - buttonPressStart[buttonIndex];
+    
+    if (!buttonLongPressTriggered[buttonIndex]) {
+      if (pressDuration >= 2000) {
+        veryLongPress = true;
+        pressed = true;
+      } else if (pressDuration >= 800) {
+        longPress = true;
+        pressed = true;
+      } else {
+        pressed = true;  // Short press
       }
     }
+  }
+  
+  // Check for long press while still holding
+  if (reading == HIGH && !buttonLongPressTriggered[buttonIndex]) {
+    unsigned long pressDuration = millis() - buttonPressStart[buttonIndex];
     
-    if (buttonState[buttonIndex] == LOW) {
-      pressDuration = millis() - buttonPressStart[buttonIndex];
-      
-      if (pressDuration >= 2000 && !buttonLongPressTriggered[buttonIndex]) {
-        veryLongPress = true;
-        buttonLongPressTriggered[buttonIndex] = true;
-        pressed = true;
-      } else if (pressDuration >= 800 && !buttonLongPressTriggered[buttonIndex]) {
-        longPress = true;
-        buttonLongPressTriggered[buttonIndex] = true;
-        pressed = true;
-      }
+    if (pressDuration >= 2000) {
+      veryLongPress = true;
+      buttonLongPressTriggered[buttonIndex] = true;
+      pressed = true;
+    } else if (pressDuration >= 800) {
+      longPress = true;
+      buttonLongPressTriggered[buttonIndex] = true;
+      pressed = true;
     }
   }
   
@@ -1332,11 +1326,13 @@ void setup() {
   // ST7789 initialization - Waveshare 2.4" is 240x320
   // init() takes width and height parameters
   tft.init(240, 320);
+  tft.invertDisplay(false);  
+
   
   // Set rotation for landscape mode (320x240)
   // You may need to adjust this (0-3) depending on your mounting orientation
   // Rotation 1 or 3 gives landscape; try both to see which orientation works
-  tft.setRotation(3);
+  tft.setRotation(1);
   
   tft.fillScreen(COLOR_BG);
   Serial.println("✓ ST7789 Display initialized (240x320)");
