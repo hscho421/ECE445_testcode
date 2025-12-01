@@ -1,17 +1,20 @@
 #include <Adafruit_GFX.h>
-#include <Adafruit_ILI9341.h>
+#include <Adafruit_ST7789.h>  // Changed from Adafruit_ILI9341.h
 #include <SPI.h>
 #include <arduinoFFT.h>
 #include <ESP32Servo.h>
 
-// ===== TFT DISPLAY (PCB PINOUT) =====
-#define TFT_MOSI  11  // D_IN
-#define TFT_CLK   12  // CLK
+// ===== TFT DISPLAY (PCB PINOUT - ST7789 Waveshare 2.4") =====
+#define TFT_MOSI  11  // D_IN / SDA
+#define TFT_CLK   12  // CLK / SCL
 #define TFT_CS    8   // CS
 #define TFT_DC    7   // DC
 #define TFT_RST   6   // RST
 #define TFT_BL    10  // Backlight
-Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
+
+// ST7789 constructor - note: 240x320 are the native dimensions
+// We'll use rotation to get 320x240 landscape
+Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
 // ===== BUTTONS (PCB PINOUT) =====
 #define BTN_TOGGLE    15  // IO3 - Main action button
@@ -148,6 +151,7 @@ const unsigned long SUCCESS_DISPLAY_TIME = 3000;
 int batteryLevel = 100;
 
 // ===== COLOR SCHEME =====
+// ST7789 uses the same 16-bit RGB565 format as ILI9341
 #define COLOR_BG        0x0841
 #define COLOR_CARD      0x1082
 #define COLOR_PRIMARY   0x07FF
@@ -826,7 +830,7 @@ void handleButtons() {
     if (toggleVeryLongPress) {
       // Very long press (2s+) - Power off from any state
       currentState = STATE_OFF;
-      tft.fillScreen(ILI9341_BLACK);
+      tft.fillScreen(ST77XX_BLACK);  // Changed from ILI9341_BLACK
       if (servoAttached) {
         servoPos = 90;
         tunerServo.write(servoPos);
@@ -1306,7 +1310,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n\n╔════════════════════════════════════════╗");
-  Serial.println("║  AUTO GUITAR TUNER - PCB v1.0          ║");
+  Serial.println("║  AUTO GUITAR TUNER - ST7789 v1.0       ║");
   Serial.println("╚════════════════════════════════════════╝\n");
 
   vReal = (double*)malloc(SAMPLES * sizeof(double));
@@ -1321,14 +1325,21 @@ void setup() {
   analogSetAttenuation(ADC_11db);
   Serial.println("✓ ADC configured (IO2)");
 
-  // Configure SPI with custom pins
+  // Configure SPI with custom pins for ST7789
   SPI.begin(TFT_CLK, -1, TFT_MOSI, TFT_CS);
   delay(100);
   
-  tft.begin();
+  // ST7789 initialization - Waveshare 2.4" is 240x320
+  // init() takes width and height parameters
+  tft.init(240, 320);
+  
+  // Set rotation for landscape mode (320x240)
+  // You may need to adjust this (0-3) depending on your mounting orientation
+  // Rotation 1 or 3 gives landscape; try both to see which orientation works
   tft.setRotation(3);
+  
   tft.fillScreen(COLOR_BG);
-  Serial.println("✓ Display initialized");
+  Serial.println("✓ ST7789 Display initialized (240x320)");
   
   // Enable backlight
   pinMode(TFT_BL, OUTPUT);
@@ -1352,8 +1363,9 @@ void setup() {
   Serial.println("\n╔════════════════════════════════════════╗");
   Serial.println("║         PCB CONFIGURATION              ║");
   Serial.println("╠════════════════════════════════════════╣");
-  Serial.println("║ Display: IO11,12,8,7,6,10             ║");
-  Serial.println("║ Buttons: IO15 (Toggle), IO46 (Select) ║");
+  Serial.println("║ Display: ST7789 Waveshare 2.4\"         ║");
+  Serial.println("║ Pins: IO11,12,8,7,6,10                 ║");
+  Serial.println("║ Buttons: IO15 (Toggle), IO46 (Select)  ║");
   Serial.println("║ Servo: IO45                            ║");
   Serial.println("║ Piezo: IO2                             ║");
   Serial.println("╠════════════════════════════════════════╣");
