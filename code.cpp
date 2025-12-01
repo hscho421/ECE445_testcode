@@ -4,30 +4,36 @@
 #include <arduinoFFT.h>
 #include <ESP32Servo.h>
 
-// ===== TFT =====
-#define TFT_CS   5
-#define TFT_DC   21
-#define TFT_RST  4
+// ===== TFT DISPLAY (PCB PINOUT) =====
+#define TFT_MOSI  11  // D_IN
+#define TFT_CLK   12  // CLK
+#define TFT_CS    8   // CS
+#define TFT_DC    7   // DC
+#define TFT_RST   6   // RST
+#define TFT_BL    10  // Backlight
 Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
 
-// ===== BUTTONS =====
-#define BTN_POWER        32
-#define BTN_START_STOP   25
-#define BTN_STRING_SEL   26
-#define BTN_TUNING_MODE  27
+// ===== BUTTONS (PCB PINOUT) =====
+#define BTN_TOGGLE    15  // IO3 - Main action button
+#define BTN_SELECT    46  // IO46 - Selection/navigation button
 
-// Button debouncing
-unsigned long lastDebounceTime[4] = {0, 0, 0, 0};
+// Button debouncing and press detection
+unsigned long lastDebounceTime[2] = {0, 0};
 const unsigned long debounceDelay = 50;
-bool lastButtonState[4] = {HIGH, HIGH, HIGH, HIGH};
-bool buttonState[4] = {HIGH, HIGH, HIGH, HIGH};
+bool lastButtonState[2] = {HIGH, HIGH};
+bool buttonState[2] = {HIGH, HIGH};
+unsigned long buttonPressStart[2] = {0, 0};
+bool buttonLongPressTriggered[2] = {false, false};
 
-// ===== PIEZO SENSOR =====
-const int PIEZO_PIN = 34;  // ADC pin for piezo sensor
+// ===== PIEZO SENSOR (PCB PINOUT) =====
+const int PIEZO_PIN = 2;  // IO2 - ADC input from amplifier
+
+// ===== SERVO MOTOR (PCB PINOUT) =====
+const int SERVO_PIN = 45;  // IO45 - PWM signal to motor
 
 // ===== FFT Configuration =====
 const uint16_t SAMPLES = 2048;
-const double SAMPLING_FREQ = 8192;  // May need adjustment based on piezo response
+const double SAMPLING_FREQ = 8192;
 ArduinoFFT<double> FFT = ArduinoFFT<double>();
 double *vReal;
 double *vImag;
@@ -60,7 +66,7 @@ bool isAutoMode = true;
 int autoTuneCurrentString = 0;
 bool autoTuneInProgress = false;
 unsigned long autoTuneStringStartTime = 0;
-const unsigned long AUTO_TUNE_TIMEOUT = 30000;  // 30s per string max
+const unsigned long AUTO_TUNE_TIMEOUT = 30000;
 
 // ===== TUNING DEFINITIONS =====
 struct TuningDef {
@@ -77,11 +83,11 @@ TuningDef tuningModes[] = {
 
 const char* STRING_NAMES[] = {"E2", "A2", "D3", "G3", "B3", "E4"};
 
-// Analysis settings - adjusted for piezo
+// Analysis settings
 const float F_MIN = 70.0f;
 const float F_MAX = 1000.0f;
-const float NOISE_THRESHOLD = 15.0;  // Adjusted for piezo - may need tuning
-int TUNE_TOLERANCE = 5;  // Now adjustable in settings
+const float NOISE_THRESHOLD = 15.0;
+int TUNE_TOLERANCE = 5;
 
 // Smoothing
 const int SMOOTH_WINDOW = 3;
@@ -98,38 +104,34 @@ const int HISTORY_SIZE = 40;
 float freqHistoryGraph[HISTORY_SIZE] = {0};
 int historyGraphIdx = 0;
 
-// Add this to the global variables section (around line 100)
 unsigned long lastReadTime = 0;
-const unsigned long READ_INTERVAL = 3000;  // 3 seconds
+const unsigned long READ_INTERVAL = 3000;
 
 // ===== STATISTICS =====
 struct Statistics {
   int totalStringsTuned;
   int sessionStringsTuned;
-  unsigned long totalTuningTime;  // milliseconds
+  unsigned long totalTuningTime;
   unsigned long sessionStartTime;
   int successfulTunes;
   int failedTunes;
-  float avgTuningTime;  // seconds
+  float avgTuningTime;
 } stats = {0, 0, 0, 0, 0, 0, 0.0};
 
 unsigned long currentTuneStartTime = 0;
 
 // ===== SERVO =====
 Servo tunerServo;
-const int SERVO_PIN = 33;
 int servoPos = 90;
 int targetServoPos = 90;
 unsigned long lastServoMove = 0;
-uint32_t SERVO_MOVE_PERIOD = 150;  // Adjustable in settings
+uint32_t SERVO_MOVE_PERIOD = 150;
 bool servoAttached = false;
 
-// Tuning history for stability
-int TUNE_STABLE_COUNT = 5;  // Adjustable in settings
+int TUNE_STABLE_COUNT = 5;
 int stableCount = 0;
 int lastCents = 0;
 
-// Servo movement tracking
 bool servoIsMoving = false;
 unsigned long servoMoveStartTime = 0;
 const uint32_t SERVO_MOVE_DURATION = 120;
@@ -139,11 +141,11 @@ int animationFrame = 0;
 unsigned long lastAnimationTime = 0;
 bool showSuccessAnimation = false;
 int successAnimationFrame = 0;
-unsigned long successAnimationStartTime = 0;  // NEW
-const unsigned long SUCCESS_DISPLAY_TIME = 3000;  // NEW (3 seconds)
+unsigned long successAnimationStartTime = 0;
+const unsigned long SUCCESS_DISPLAY_TIME = 3000;
 
 // ===== BATTERY SIMULATION =====
-int batteryLevel = 100;  // Percentage (simulated for now)
+int batteryLevel = 100;
 
 // ===== COLOR SCHEME =====
 #define COLOR_BG        0x0841
@@ -159,9 +161,8 @@ int batteryLevel = 100;  // Percentage (simulated for now)
 #define COLOR_GOLD      0xFEA0
 
 // ===== PIEZO CALIBRATION =====
-// These values may need adjustment based on your piezo/amplifier setup
-float PIEZO_GAIN_ADJUST = 1.0;  // Adjust if signal too weak/strong
-bool USE_DC_BLOCK = true;  // Remove DC offset from piezo
+float PIEZO_GAIN_ADJUST = 1.0;
+bool USE_DC_BLOCK = true;
 
 // ===== UI HELPER FUNCTIONS =====
 
@@ -204,11 +205,9 @@ void drawCentsMeter(int x, int y, int w, int h, int cents) {
 }
 
 void drawBatteryIcon(int x, int y) {
-  // Battery outline
   tft.drawRect(x, y + 2, 20, 10, COLOR_TEXT_DIM);
   tft.fillRect(x + 20, y + 4, 2, 6, COLOR_TEXT_DIM);
   
-  // Battery fill
   uint16_t fillColor = COLOR_SUCCESS;
   if (batteryLevel < 20) fillColor = COLOR_DANGER;
   else if (batteryLevel < 50) fillColor = COLOR_WARNING;
@@ -218,7 +217,6 @@ void drawBatteryIcon(int x, int y) {
     tft.fillRect(x + 2, y + 4, fillWidth, 6, fillColor);
   }
   
-  // Percentage text
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
   tft.setCursor(x + 24, y + 3);
@@ -227,15 +225,12 @@ void drawBatteryIcon(int x, int y) {
 }
 
 void drawFrequencyGraph(int x, int y, int w, int h, float targetFreq) {
-  // Background
   tft.fillRect(x, y, w, h, COLOR_BG);
   tft.drawRect(x, y, w, h, COLOR_TEXT_DIM);
   
-  // Target line
   int targetY = y + h/2;
   tft.drawFastHLine(x, targetY, w, COLOR_SUCCESS);
   
-  // Draw history
   for (int i = 1; i < HISTORY_SIZE; i++) {
     int idx1 = (historyGraphIdx + i - 1) % HISTORY_SIZE;
     int idx2 = (historyGraphIdx + i) % HISTORY_SIZE;
@@ -263,21 +258,17 @@ void addToFrequencyHistory(float freq) {
 void drawSuccessAnimation() {
   if (!showSuccessAnimation) return;
   
-  // Pulsing checkmark
   int centerX = 160;
   int centerY = 120;
   int size = 30 + (successAnimationFrame % 10);
   
-  // Green circle
   tft.fillCircle(centerX, centerY, size, COLOR_SUCCESS);
   
-  // Checkmark
   tft.drawLine(centerX - 10, centerY, centerX - 3, centerY + 10, COLOR_TEXT);
   tft.drawLine(centerX - 3, centerY + 10, centerX + 12, centerY - 10, COLOR_TEXT);
   tft.drawLine(centerX - 9, centerY, centerX - 3, centerY + 9, COLOR_TEXT);
   tft.drawLine(centerX - 3, centerY + 9, centerX + 11, centerY - 10, COLOR_TEXT);
   
-  // Stars around
   for (int i = 0; i < 4; i++) {
     int angle = (successAnimationFrame * 10 + i * 90) % 360;
     int sx = centerX + cos(angle * PI / 180) * (40 + successAnimationFrame);
@@ -286,7 +277,7 @@ void drawSuccessAnimation() {
   }
   
   successAnimationFrame++;
-  if (successAnimationFrame > 60) {  // Loop the animation
+  if (successAnimationFrame > 60) {
     successAnimationFrame = 0;
   }
 }
@@ -296,17 +287,14 @@ void drawSuccessAnimation() {
 void drawStandbyScreen() {
   tft.fillScreen(COLOR_BG);
   
-  // Battery indicator
   drawBatteryIcon(250, 5);
   
-  // Header card
   drawCard(10, 10, 300, 60);
   tft.setTextSize(3);
   tft.setTextColor(COLOR_PRIMARY);
   tft.setCursor(50, 25);
   tft.print("GUITAR TUNER");
   
-  // Status card
   drawCard(10, 80, 300, 50);
   tft.setTextSize(2);
   tft.setTextColor(COLOR_TEXT_DIM);
@@ -317,7 +305,6 @@ void drawStandbyScreen() {
   tft.setCursor(110, 88);
   tft.print("READY");
   
-  // Session stats
   tft.setTextSize(1);
   tft.setTextColor(COLOR_ACCENT);
   tft.setCursor(20, 108);
@@ -325,7 +312,6 @@ void drawStandbyScreen() {
   tft.print(stats.sessionStringsTuned);
   tft.print(" strings");
   
-  // Tuning mode
   drawCard(10, 140, 145, 38);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
@@ -336,7 +322,6 @@ void drawStandbyScreen() {
   tft.setCursor(20, 160);
   tft.print(tuningModes[tuningMode].name);
   
-  // String mode
   drawCard(165, 140, 145, 38);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
@@ -348,27 +333,22 @@ void drawStandbyScreen() {
   if (isAutoMode) tft.print("AUTO");
   else tft.print(STRING_NAMES[selectedString]);
   
-  // Action buttons
-  drawCard(10, 188, 145, 40);
-  tft.setTextSize(2);
-  tft.setTextColor(COLOR_SUCCESS);
-  tft.setCursor(23, 200);
-  tft.print("START");
-  
-  drawCard(165, 188, 145, 40);
-  tft.setTextSize(2);
+  drawCard(10, 188, 300, 40);
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT_DIM);
+  tft.setCursor(20, 195);
+  tft.print("TOGGLE: Start  |  SELECT: String/Mode");
+  tft.setTextSize(1);
   tft.setTextColor(COLOR_PURPLE);
-  tft.setCursor(175, 200);
-  tft.print("AUTO ALL");
+  tft.setCursor(20, 210);
+  tft.print("Long TOGGLE: Auto All | Long SELECT: Mode");
 }
 
 void drawTuningScreen() {
   tft.fillScreen(COLOR_BG);
   
-  // Battery
   drawBatteryIcon(250, 5);
   
-  // Compact header
   drawCard(10, 5, 230, 30);
   tft.setTextSize(2);
   tft.setTextColor(COLOR_SUCCESS);
@@ -380,14 +360,12 @@ void drawTuningScreen() {
   tft.setCursor(150, 12);
   tft.print(tuningModes[tuningMode].name);
   
-  // Signal level
   drawCard(10, 40, 300, 28);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
   tft.setCursor(20, 47);
   tft.print("SIGNAL");
   
-  // Frequency and note
   drawCard(10, 73, 145, 40);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
@@ -400,19 +378,15 @@ void drawTuningScreen() {
   tft.setCursor(175, 80);
   tft.print("NOTE");
   
-  // Frequency history graph
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
   tft.setCursor(20, 118);
   tft.print("TUNING PROGRESS");
-  // Graph area: 10, 128, 300, 40
   
-  // Cents meter
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
   tft.setCursor(20, 173);
   tft.print("ACCURACY");
-  // Meter will be drawn in update
 }
 
 void drawAutoTuneAllScreen() {
@@ -420,29 +394,26 @@ void drawAutoTuneAllScreen() {
   
   drawBatteryIcon(250, 5);
   
-  // Header
   drawCard(10, 10, 300, 45);
   tft.setTextSize(3);
   tft.setTextColor(COLOR_PURPLE);
   tft.setCursor(30, 20);
   tft.print("AUTO TUNE");
   
-  // Progress
   drawCard(10, 65, 300, 60);
   tft.setTextSize(2);
   tft.setTextColor(COLOR_TEXT);
   tft.setCursor(20, 75);
   tft.print("Progress:");
   
-  // String indicators
   int yStart = 95;
   for (int i = 0; i < 6; i++) {
     int x = 20 + (i % 3) * 95;
     int y = yStart + (i / 3) * 25;
     
     uint16_t color = COLOR_TEXT_DIM;
-    if (i < autoTuneCurrentString) color = COLOR_SUCCESS;  // Done
-    else if (i == autoTuneCurrentString) color = COLOR_WARNING;  // Current
+    if (i < autoTuneCurrentString) color = COLOR_SUCCESS;
+    else if (i == autoTuneCurrentString) color = COLOR_WARNING;
     
     tft.setTextSize(2);
     tft.setTextColor(color);
@@ -452,20 +423,18 @@ void drawAutoTuneAllScreen() {
     if (i < autoTuneCurrentString) {
       tft.print(" ");
       tft.setTextColor(COLOR_SUCCESS);
-      tft.print((char)251);  // Checkmark
+      tft.print((char)251);
     } else if (i == autoTuneCurrentString) {
       tft.print(" ...");
     }
   }
   
-  // Overall progress bar
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
   tft.setCursor(20, 150);
   tft.print("Overall Progress:");
   drawProgressBar(20, 163, 280, 20, autoTuneCurrentString, 6, COLOR_PURPLE);
   
-  // Current string details
   if (autoTuneCurrentString < 6) {
     drawCard(10, 190, 300, 45);
     tft.setTextSize(1);
@@ -482,7 +451,6 @@ void drawAutoTuneAllScreen() {
 }
 
 void updateAutoTuneAllScreen(float freq, int cents) {
-  // Update current string status
   tft.fillRect(20, 213, 280, 20, COLOR_CARD);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_ACCENT);
@@ -562,8 +530,8 @@ void drawStringSelectScreen() {
   
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
-  tft.setCursor(10, 228);
-  tft.print("Press STRING SEL to cycle");
+  tft.setCursor(20, 228);
+  tft.print("SELECT to cycle | TOGGLE to confirm");
 }
 
 void drawModeSelectScreen() {
@@ -593,6 +561,11 @@ void drawModeSelectScreen() {
       tft.drawRoundRect(11, y + 1, 298, 36, 7, COLOR_SUCCESS);
     }
   }
+  
+  tft.setTextSize(1);
+  tft.setTextColor(COLOR_TEXT_DIM);
+  tft.setCursor(20, 228);
+  tft.print("SELECT to cycle | TOGGLE to confirm");
 }
 
 void drawStatisticsScreen() {
@@ -606,7 +579,6 @@ void drawStatisticsScreen() {
   tft.setCursor(40, 22);
   tft.print("STATISTICS");
   
-  // Session stats
   drawCard(10, 70, 145, 75);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
@@ -621,7 +593,6 @@ void drawStatisticsScreen() {
   tft.setCursor(20, 130);
   tft.print("Strings Tuned");
   
-  // Total stats
   drawCard(165, 70, 145, 75);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
@@ -636,7 +607,6 @@ void drawStatisticsScreen() {
   tft.setCursor(175, 130);
   tft.print("Total Tuned");
   
-  // Success rate
   drawCard(10, 155, 145, 60);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
@@ -651,7 +621,6 @@ void drawStatisticsScreen() {
   tft.print(successRate);
   tft.print("%");
   
-  // Avg time
   drawCard(165, 155, 145, 60);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
@@ -663,7 +632,6 @@ void drawStatisticsScreen() {
   tft.print(stats.avgTuningTime, 1);
   tft.print("s");
   
-  // Instructions
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
   tft.setCursor(50, 225);
@@ -681,7 +649,6 @@ void drawSettingsScreen() {
   tft.setCursor(60, 20);
   tft.print("SETTINGS");
   
-  // Tolerance
   drawCard(10, 65, 300, 40);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
@@ -694,7 +661,6 @@ void drawSettingsScreen() {
   tft.print(TUNE_TOLERANCE);
   tft.print(" cents");
   
-  // Servo speed
   drawCard(10, 115, 300, 40);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
@@ -706,7 +672,6 @@ void drawSettingsScreen() {
   tft.print(SERVO_MOVE_PERIOD);
   tft.print(" ms");
   
-  // Stability
   drawCard(10, 165, 300, 40);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
@@ -721,18 +686,16 @@ void drawSettingsScreen() {
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
   tft.setCursor(30, 220);
-  tft.print("Long press buttons to adjust");
+  tft.print("Long press SELECT to adjust");
 }
 
 void updateTuningScreen(float freq, const String& note, int cents) {
-  // Update signal level
   int signalPercent = constrain(map(signalLevel, 0, 100, 0, 100), 0, 100);
   uint16_t signalColor = (signalLevel > NOISE_THRESHOLD) ? COLOR_SUCCESS : COLOR_DANGER;
   
   tft.fillRect(100, 47, 200, 15, COLOR_CARD);
   drawProgressBar(100, 47, 200, 15, signalPercent, 100, signalColor);
   
-  // Update frequency
   tft.fillRect(20, 93, 125, 18, COLOR_CARD);
   tft.setTextSize(2);
   tft.setTextColor(COLOR_PRIMARY);
@@ -746,14 +709,12 @@ void updateTuningScreen(float freq, const String& note, int cents) {
     tft.print("--");
   }
   
-  // Update note
   tft.fillRect(175, 93, 125, 18, COLOR_CARD);
   tft.setTextSize(2);
   tft.setTextColor(COLOR_WARNING);
   tft.setCursor(200, 95);
   tft.print(note);
   
-  // Update frequency graph
   if (freq > 0) {
     addToFrequencyHistory(freq);
     int stringNum = identifyString(freq);
@@ -763,10 +724,8 @@ void updateTuningScreen(float freq, const String& note, int cents) {
     }
   }
   
-  // Update cents meter
   drawCentsMeter(10, 183, 300, 35, cents);
   
-  // Update cents value and status
   tft.fillRect(10, 223, 300, 15, COLOR_BG);
   tft.setTextSize(2);
   uint16_t centsColor = COLOR_SUCCESS;
@@ -791,27 +750,59 @@ void updateTuningScreen(float freq, const String& note, int cents) {
   tft.print(" c");
 }
 
-// ===== BUTTON HANDLING =====
+// ===== BUTTON HANDLING (2-BUTTON SYSTEM) =====
 
 void initButtons() {
-  pinMode(BTN_POWER, INPUT_PULLUP);
-  pinMode(BTN_START_STOP, INPUT_PULLUP);
-  pinMode(BTN_STRING_SEL, INPUT_PULLUP);
-  pinMode(BTN_TUNING_MODE, INPUT_PULLUP);
+  pinMode(BTN_TOGGLE, INPUT_PULLUP);
+  pinMode(BTN_SELECT, INPUT_PULLUP);
 }
 
-bool readButton(int buttonIndex, int pin) {
+// Enhanced button reading with long press detection
+bool readButton(int buttonIndex, int pin, bool &longPress, bool &veryLongPress) {
   bool reading = digitalRead(pin);
+  longPress = false;
+  veryLongPress = false;
   
   if (reading != lastButtonState[buttonIndex]) {
     lastDebounceTime[buttonIndex] = millis();
+    if (reading == LOW) {
+      buttonPressStart[buttonIndex] = millis();
+      buttonLongPressTriggered[buttonIndex] = false;
+    }
   }
   
   bool pressed = false;
+  unsigned long pressDuration = 0;
+  
   if ((millis() - lastDebounceTime[buttonIndex]) > debounceDelay) {
     if (reading != buttonState[buttonIndex]) {
       buttonState[buttonIndex] = reading;
-      if (buttonState[buttonIndex] == LOW) {
+      
+      if (buttonState[buttonIndex] == HIGH && lastButtonState[buttonIndex] == LOW) {
+        pressDuration = millis() - buttonPressStart[buttonIndex];
+        
+        if (pressDuration >= 2000 && !buttonLongPressTriggered[buttonIndex]) {
+          veryLongPress = true;
+          pressed = true;
+        } else if (pressDuration >= 800 && !buttonLongPressTriggered[buttonIndex]) {
+          longPress = true;
+          pressed = true;
+        } else if (pressDuration < 800) {
+          pressed = true;
+        }
+      }
+    }
+    
+    if (buttonState[buttonIndex] == LOW) {
+      pressDuration = millis() - buttonPressStart[buttonIndex];
+      
+      if (pressDuration >= 2000 && !buttonLongPressTriggered[buttonIndex]) {
+        veryLongPress = true;
+        buttonLongPressTriggered[buttonIndex] = true;
+        pressed = true;
+      } else if (pressDuration >= 800 && !buttonLongPressTriggered[buttonIndex]) {
+        longPress = true;
+        buttonLongPressTriggered[buttonIndex] = true;
         pressed = true;
       }
     }
@@ -822,79 +813,32 @@ bool readButton(int buttonIndex, int pin) {
 }
 
 void handleButtons() {
-  // Power button
-  if (readButton(0, BTN_POWER)) {
-    if (currentState == STATE_OFF) {
-      currentState = STATE_STANDBY;
-      stats.sessionStartTime = millis();
-      stats.sessionStringsTuned = 0;
-      drawStandbyScreen();
-      Serial.println("System ON");
-    } else if (currentState == STATE_STATISTICS) {
-      currentState = STATE_STANDBY;
-      drawStandbyScreen();
-    } else if (currentState == STATE_SETTINGS) {
-      currentState = STATE_STANDBY;
-      drawStandbyScreen();
-    } else {
-      // Long press for power off - check if held for 2 seconds
-      unsigned long pressStart = millis();
-      while (digitalRead(BTN_POWER) == LOW && millis() - pressStart < 2000) {
-        delay(10);
-      }
-      if (millis() - pressStart >= 2000) {
-        currentState = STATE_OFF;
-        tft.fillScreen(ILI9341_BLACK);
-        if (servoAttached) {
-          servoPos = 90;
-          tunerServo.write(servoPos);
-          delay(200);
-          tunerServo.detach();
-          servoAttached = false;
-        }
-        Serial.println("System OFF");
-      } else {
-        // Short press - go to statistics
-        currentState = STATE_STATISTICS;
-        drawStatisticsScreen();
-      }
-    }
-  }
+  bool toggleLongPress = false;
+  bool toggleVeryLongPress = false;
+  bool selectLongPress = false;
+  bool selectVeryLongPress = false;
   
-  if (currentState == STATE_OFF) return;
+  bool togglePressed = readButton(0, BTN_TOGGLE, toggleLongPress, toggleVeryLongPress);
+  bool selectPressed = readButton(1, BTN_SELECT, selectLongPress, selectVeryLongPress);
   
-  // Start/Stop button
-  if (readButton(1, BTN_START_STOP)) {
-    if (currentState == STATE_TUNING || currentState == STATE_AUTO_TUNE_ALL) {
-      currentState = STATE_STANDBY;
-      autoTuneInProgress = false;
-      servoPos = 90;
-      targetServoPos = 90;
+  // TOGGLE BUTTON LOGIC
+  if (togglePressed) {
+    if (toggleVeryLongPress) {
+      // Very long press (2s+) - Power off from any state
+      currentState = STATE_OFF;
+      tft.fillScreen(ILI9341_BLACK);
       if (servoAttached) {
+        servoPos = 90;
         tunerServo.write(servoPos);
         delay(200);
         tunerServo.detach();
         servoAttached = false;
       }
+      Serial.println("System OFF");
       
-      // Record tuning time
-      if (currentTuneStartTime > 0) {
-        unsigned long tuneTime = millis() - currentTuneStartTime;
-        stats.totalTuningTime += tuneTime;
-        stats.avgTuningTime = (stats.totalTuningTime / 1000.0f) / (stats.totalStringsTuned > 0 ? stats.totalStringsTuned : 1);
-      }
-      
-      drawStandbyScreen();
-      Serial.println("Tuning stopped");
-    } else if (currentState == STATE_STANDBY) {
-      // Check if long press for AUTO TUNE ALL
-      unsigned long pressStart = millis();
-      while (digitalRead(BTN_START_STOP) == LOW && millis() - pressStart < 1000) {
-        delay(10);
-      }
-      
-      if (millis() - pressStart >= 1000) {
-        // Long press - Auto tune all
+    } else if (toggleLongPress) {
+      // Long press (800ms) - Auto tune all (from standby only)
+      if (currentState == STATE_STANDBY) {
         currentState = STATE_AUTO_TUNE_ALL;
         autoTuneInProgress = true;
         autoTuneCurrentString = 0;
@@ -907,8 +851,20 @@ void handleButtons() {
         }
         drawAutoTuneAllScreen();
         Serial.println("AUTO TUNE ALL started");
-      } else {
-        // Short press - normal tuning
+      }
+      
+    } else {
+      // Short press - Main action button
+      if (currentState == STATE_OFF) {
+        // Power on
+        currentState = STATE_STANDBY;
+        stats.sessionStartTime = millis();
+        stats.sessionStringsTuned = 0;
+        drawStandbyScreen();
+        Serial.println("System ON");
+        
+      } else if (currentState == STATE_STANDBY) {
+        // Start tuning
         currentState = STATE_TUNING;
         drawTuningScreen();
         stableCount = 0;
@@ -918,90 +874,122 @@ void handleButtons() {
           servoAttached = true;
         }
         Serial.println("Tuning started");
-      }
-    } else {
-      currentState = STATE_STANDBY;
-      drawStandbyScreen();
-    }
-  }
-  
-  // String select button
-  if (readButton(2, BTN_STRING_SEL)) {
-    if (currentState == STATE_STRING_SELECT) {
-      if (isAutoMode) {
-        isAutoMode = false;
-        selectedString = 0;
-      } else {
-        selectedString++;
-        if (selectedString > 5) {
-          isAutoMode = true;
-          selectedString = -1;
-          currentState = STATE_STANDBY;
-          drawStandbyScreen();
-          Serial.println("String selection complete");
-          return;
+        
+      } else if (currentState == STATE_TUNING || currentState == STATE_AUTO_TUNE_ALL) {
+        // Stop tuning
+        currentState = STATE_STANDBY;
+        autoTuneInProgress = false;
+        servoPos = 90;
+        targetServoPos = 90;
+        if (servoAttached) {
+          tunerServo.write(servoPos);
+          delay(200);
+          tunerServo.detach();
+          servoAttached = false;
         }
+        
+        if (currentTuneStartTime > 0) {
+          unsigned long tuneTime = millis() - currentTuneStartTime;
+          stats.totalTuningTime += tuneTime;
+          stats.avgTuningTime = (stats.totalTuningTime / 1000.0f) / (stats.totalStringsTuned > 0 ? stats.totalStringsTuned : 1);
+        }
+        
+        drawStandbyScreen();
+        Serial.println("Tuning stopped");
+        
+      } else if (currentState == STATE_STRING_SELECT) {
+        // Confirm string selection
+        currentState = STATE_STANDBY;
+        drawStandbyScreen();
+        Serial.println("String selection confirmed");
+        
+      } else if (currentState == STATE_MODE_SELECT) {
+        // Confirm mode selection
+        currentState = STATE_STANDBY;
+        drawStandbyScreen();
+        Serial.println("Mode selection confirmed");
+        
+      } else {
+        // Return to standby from other screens
+        currentState = STATE_STANDBY;
+        drawStandbyScreen();
       }
-      drawStringSelectScreen();
-      Serial.printf("String select: %s\n", isAutoMode ? "AUTO" : STRING_NAMES[selectedString]);
-    } else if (currentState == STATE_STATISTICS) {
-      currentState = STATE_STANDBY;
-      drawStandbyScreen();
-    } else {
-      currentState = STATE_STRING_SELECT;
-      drawStringSelectScreen();
     }
   }
   
-  // Tuning mode button
-  if (readButton(3, BTN_TUNING_MODE)) {
-    if (currentState == STATE_MODE_SELECT) {
-      tuningMode = (TuningMode)((tuningMode + 1) % 4);
-      drawModeSelectScreen();
-      Serial.printf("Tuning mode: %s\n", tuningModes[tuningMode].name);
-    } else if (currentState == STATE_STATISTICS) {
-      currentState = STATE_STANDBY;
-      drawStandbyScreen();
-    } else if (currentState == STATE_SETTINGS) {
-      currentState = STATE_STANDBY;
-      drawStandbyScreen();
-    } else {
-      // Check for long press to enter settings
-      unsigned long pressStart = millis();
-      while (digitalRead(BTN_TUNING_MODE) == LOW && millis() - pressStart < 1500) {
-        delay(10);
-      }
-      
-      if (millis() - pressStart >= 1500) {
+  // SELECT BUTTON LOGIC
+  if (selectPressed) {
+    if (selectVeryLongPress) {
+      // Very long press (2s+) - Settings
+      if (currentState == STATE_STANDBY) {
         currentState = STATE_SETTINGS;
         drawSettingsScreen();
         Serial.println("Entered settings");
-      } else {
+      }
+      
+    } else if (selectLongPress) {
+      // Long press (800ms) - Mode select or Statistics
+      if (currentState == STATE_STANDBY) {
         currentState = STATE_MODE_SELECT;
         drawModeSelectScreen();
+        Serial.println("Mode selection");
+      } else if (currentState == STATE_TUNING || currentState == STATE_AUTO_TUNE_ALL) {
+        // Show statistics while tuning
+        SystemState prevState = currentState;
+        currentState = STATE_STATISTICS;
+        drawStatisticsScreen();
+      }
+      
+    } else {
+      // Short press - String selection or cycle
+      if (currentState == STATE_STANDBY) {
+        currentState = STATE_STRING_SELECT;
+        drawStringSelectScreen();
+        Serial.println("String selection");
+        
+      } else if (currentState == STATE_STRING_SELECT) {
+        // Cycle through strings
+        if (isAutoMode) {
+          isAutoMode = false;
+          selectedString = 0;
+        } else {
+          selectedString++;
+          if (selectedString > 5) {
+            isAutoMode = true;
+            selectedString = -1;
+          }
+        }
+        drawStringSelectScreen();
+        Serial.printf("String: %s\n", isAutoMode ? "AUTO" : STRING_NAMES[selectedString]);
+        
+      } else if (currentState == STATE_MODE_SELECT) {
+        // Cycle through modes
+        tuningMode = (TuningMode)((tuningMode + 1) % 4);
+        drawModeSelectScreen();
+        Serial.printf("Mode: %s\n", tuningModes[tuningMode].name);
+        
+      } else if (currentState == STATE_STATISTICS || currentState == STATE_SETTINGS) {
+        // Return to standby
+        currentState = STATE_STANDBY;
+        drawStandbyScreen();
       }
     }
   }
 }
 
-// ===== AUDIO PROCESSING (MODIFIED FOR PIEZO) =====
+// ===== AUDIO PROCESSING =====
 
 void readSinglePiezoValue() {
   unsigned long currentTime = millis();
   
   if (currentTime - lastReadTime >= READ_INTERVAL) {
-    // Read single value from piezo
     int adcValue = analogRead(PIEZO_PIN);
-    
-    // Convert to voltage (assuming 12-bit ADC and 3.3V reference)
     float voltage = (adcValue / 4095.0) * 3.3;
     
-    // Print the reading
     Serial.println("═══════════════════════════════════");
-    Serial.print("Piezo ADC Value: ");
+    Serial.print("Piezo ADC: ");
     Serial.print(adcValue);
-    Serial.print(" / 4095");
-    Serial.print(" (");
+    Serial.print(" / 4095 (");
     Serial.print(voltage, 3);
     Serial.println(" V)");
     Serial.println("═══════════════════════════════════");
@@ -1018,61 +1006,49 @@ void captureSamples() {
     unsigned long tTarget = startTime + (i * period);
     while (micros() < tTarget) { }
     
-    // Read from piezo sensor
     int adcValue = analogRead(PIEZO_PIN);
-    
-    // Apply gain adjustment if needed
     vReal[i] = (double)adcValue * PIEZO_GAIN_ADJUST;
     vImag[i] = 0.0;
   }
 }
 
 void preprocessSignal() {
-  // Calculate mean for DC offset removal
   double mean = 0;
   for (int i = 0; i < SAMPLES; i++) {
     mean += vReal[i];
   }
   mean /= SAMPLES;
 
-  // Remove DC offset and apply window function
   signalLevel = 0;
   for (int i = 0; i < SAMPLES; i++) {
-    // DC blocking (especially important for piezo sensors)
     if (USE_DC_BLOCK) {
       vReal[i] -= mean;
     }
     
-    // Hamming window for better frequency resolution
     double w = 0.54 - 0.46 * cos(2.0 * PI * i / (SAMPLES - 1));
     vReal[i] *= w;
     
-    // Calculate signal level
     signalLevel += fabs(vReal[i]);
   }
   signalLevel /= SAMPLES;
   
-  // Debug: Print signal level periodically
   static unsigned long lastPrint = 0;
   if (millis() - lastPrint > 1000) {
-    Serial.print("Signal level: ");
+    Serial.print("Signal: ");
     Serial.println(signalLevel);
     lastPrint = millis();
   }
 }
 
 float findPeakFrequency() {
-  // Perform FFT
   FFT.compute(vReal, vImag, SAMPLES, FFT_FORWARD);
   FFT.complexToMagnitude(vReal, vImag, SAMPLES);
 
-  // Calculate frequency resolution
   double df = SAMPLING_FREQ / SAMPLES;
   int minBin = (int)(F_MIN / df);
   int maxBin = (int)(F_MAX / df);
   if (maxBin >= SAMPLES/2) maxBin = SAMPLES/2 - 1;
 
-  // Find peak in frequency range
   int peakBin = minBin;
   double peakMag = 0;
   for (int i = minBin; i <= maxBin; i++) {
@@ -1082,12 +1058,10 @@ float findPeakFrequency() {
     }
   }
   
-  // Check if signal is strong enough
   if (peakMag < NOISE_THRESHOLD) {
     return 0.0f;
   }
 
-  // Parabolic interpolation for better frequency accuracy
   if (peakBin > minBin && peakBin < maxBin) {
     double y1 = vReal[peakBin - 1];
     double y2 = vReal[peakBin];
@@ -1097,7 +1071,6 @@ float findPeakFrequency() {
     
     float freq = bin * df;
     
-    // Debug: Print detected frequency periodically
     static unsigned long lastFreqPrint = 0;
     if (millis() - lastFreqPrint > 500 && freq > F_MIN) {
       Serial.print("Detected: ");
@@ -1128,22 +1101,18 @@ float smoothFreq(float f) {
 int identifyString(float f) {
   if (f <= 0) return -1;
   
-  // Auto tune all mode - lock to current string
   if (currentState == STATE_AUTO_TUNE_ALL && autoTuneInProgress) {
     return autoTuneCurrentString;
   }
   
-  // Manual mode
   if (!isAutoMode) return selectedString;
   
-  // Auto-detect
   int best = -1; 
   float bestDiff = 1e9;
   float* targetFreqs = tuningModes[tuningMode].freqs;
   
   for (int i = 0; i < 6; i++) {
     float diff = fabsf(f - targetFreqs[i]);
-    // Increased tolerance window for better string detection
     if (diff < targetFreqs[i] * 0.26f && diff < bestDiff) {
       bestDiff = diff; 
       best = i;
@@ -1191,14 +1160,12 @@ void updateServoFromCents(int cents) {
   
   unsigned long now = millis();
   
-  // Check if in tune - SIMPLIFIED LOGIC
   if (abs(cents) <= TUNE_TOLERANCE) {
-    stableCount++;  // Just increment if within tolerance
+    stableCount++;
     
     if (stableCount >= TUNE_STABLE_COUNT) {
       servoIsMoving = false;
       
-      // Update statistics
       stats.totalStringsTuned++;
       stats.sessionStringsTuned++;
       stats.successfulTunes++;
@@ -1210,26 +1177,23 @@ void updateServoFromCents(int cents) {
         currentTuneStartTime = 0;
       }
       
-      // Show success animation
       showSuccessAnimation = true;
       successAnimationFrame = 0;
-      successAnimationStartTime = millis();  // Start the timer
+      successAnimationStartTime = millis();
       
       Serial.println("✓ IN TUNE!");
       
-      // LOCK THE SERVO - don't allow further movement
       targetServoPos = servoPos;
       lastCents = cents;
       
-      return;  // Exit early - let the main loop handle the animation
+      return;
     }
   } else {
-    stableCount = 0;  // Reset only when OUT of tolerance
+    stableCount = 0;
   }
   
-  // Check timeout for auto tune all
   if (currentState == STATE_AUTO_TUNE_ALL && millis() - autoTuneStringStartTime > AUTO_TUNE_TIMEOUT) {
-    Serial.println("String tuning timeout - skipping");
+    Serial.println("Timeout - skipping");
     stats.failedTunes++;
     autoTuneCurrentString++;
     stableCount = 0;
@@ -1246,7 +1210,6 @@ void updateServoFromCents(int cents) {
     return;
   }
   
-  // Check if servo is moving
   if (servoIsMoving) {
     if (now - servoMoveStartTime < SERVO_MOVE_DURATION) {
       return;
@@ -1255,10 +1218,8 @@ void updateServoFromCents(int cents) {
     }
   }
   
-  // Rate limiting
   if (now - lastServoMove < SERVO_MOVE_PERIOD) return;
   
-  // Calculate step
   int step = 1;
   int absCents = abs(cents);
   
@@ -1267,7 +1228,6 @@ void updateServoFromCents(int cents) {
   else if (absCents > 10) step = 2;
   else step = 1;
   
-  // Move servo
   if (cents < 0) {
     targetServoPos = servoPos + step;
   } else {
@@ -1289,18 +1249,15 @@ void updateServoFromCents(int cents) {
 }
 
 void checkSuccessAnimationComplete() {
-  // Check if animation has been showing for 3 seconds
   if (showSuccessAnimation && (millis() - successAnimationStartTime >= SUCCESS_DISPLAY_TIME)) {
     showSuccessAnimation = false;
     successAnimationFrame = 0;
     
-    // Move to next string based on mode
     if (currentState == STATE_AUTO_TUNE_ALL) {
       autoTuneCurrentString++;
       stableCount = 0;
       
       if (autoTuneCurrentString >= 6) {
-        // All strings done!
         currentState = STATE_STANDBY;
         autoTuneInProgress = false;
         if (servoAttached) {
@@ -1316,18 +1273,16 @@ void checkSuccessAnimationComplete() {
         autoTuneStringStartTime = millis();
         currentTuneStartTime = millis();
         drawAutoTuneAllScreen();
-        Serial.printf("Moving to next string: %s\n", STRING_NAMES[autoTuneCurrentString]);
+        Serial.printf("Next: %s\n", STRING_NAMES[autoTuneCurrentString]);
       }
     } else if (currentState == STATE_TUNING) {
-      // Manual tuning mode
       if (!isAutoMode && selectedString < 5) {
         selectedString++;
         stableCount = 0;
         currentTuneStartTime = millis();
         drawTuningScreen();
-        Serial.printf("Moving to next string: %s\n", STRING_NAMES[selectedString]);
+        Serial.printf("Next: %s\n", STRING_NAMES[selectedString]);
       } else if (!isAutoMode && selectedString >= 5) {
-        // Last string done
         currentState = STATE_STANDBY;
         if (servoAttached) {
           servoPos = 90;
@@ -1339,7 +1294,6 @@ void checkSuccessAnimationComplete() {
         drawStandbyScreen();
         Serial.println("Manual tuning complete!");
       } else {
-        // Auto mode or done - just redraw
         drawTuningScreen();
       }
     }
@@ -1352,7 +1306,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n\n╔════════════════════════════════════════╗");
-  Serial.println("║  AUTO GUITAR TUNER - PIEZO v3.0        ║");
+  Serial.println("║  AUTO GUITAR TUNER - PCB v1.0          ║");
   Serial.println("╚════════════════════════════════════════╝\n");
 
   vReal = (double*)malloc(SAMPLES * sizeof(double));
@@ -1363,67 +1317,66 @@ void setup() {
   }
   Serial.println("✓ Memory allocated");
 
-  // Configure ADC for piezo sensor
-  analogReadResolution(12);  // 12-bit resolution (0-4095)
-  analogSetAttenuation(ADC_11db);  // Full range 0-3.3V
-  Serial.println("✓ ADC configured for piezo");
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  Serial.println("✓ ADC configured (IO2)");
 
-  SPI.begin();
+  // Configure SPI with custom pins
+  SPI.begin(TFT_CLK, -1, TFT_MOSI, TFT_CS);
   delay(100);
+  
   tft.begin();
   tft.setRotation(3);
   tft.fillScreen(COLOR_BG);
   Serial.println("✓ Display initialized");
+  
+  // Enable backlight
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  Serial.println("✓ Backlight enabled");
 
   initButtons();
-  Serial.println("✓ Buttons initialized");
+  Serial.println("✓ Buttons initialized (IO15, IO46)");
 
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
   ESP32PWM::allocateTimer(3);
   tunerServo.setPeriodHertz(50);
-  Serial.println("✓ Servo configured");
+  Serial.println("✓ Servo configured (IO45)");
 
-  // Initialize statistics
   stats.sessionStartTime = millis();
   
   drawStandbyScreen();
   
   Serial.println("\n╔════════════════════════════════════════╗");
-  Serial.println("║           FEATURES ENABLED             ║");
+  Serial.println("║         PCB CONFIGURATION              ║");
   Serial.println("╠════════════════════════════════════════╣");
-  Serial.println("║ ✓ Piezo Sensor Input                   ║");
-  Serial.println("║ ✓ Manual Tuning                        ║");
-  Serial.println("║ ✓ Auto Tune All Strings               ║");
-  Serial.println("║ ✓ Frequency History Graph              ║");
-  Serial.println("║ ✓ Success Animations                   ║");
-  Serial.println("║ ✓ Session Statistics                   ║");
-  Serial.println("║ ✓ Battery Indicator                    ║");
-  Serial.println("║ ✓ Settings Menu                        ║");
-  Serial.println("║ ✓ 4 Tuning Modes                       ║");
+  Serial.println("║ Display: IO11,12,8,7,6,10             ║");
+  Serial.println("║ Buttons: IO15 (Toggle), IO46 (Select) ║");
+  Serial.println("║ Servo: IO45                            ║");
+  Serial.println("║ Piezo: IO2                             ║");
+  Serial.println("╠════════════════════════════════════════╣");
+  Serial.println("║ BUTTON GUIDE:                          ║");
+  Serial.println("║ • TOGGLE: Start/Stop (short)           ║");
+  Serial.println("║           Auto All (long 800ms)        ║");
+  Serial.println("║           Power Off (very long 2s)     ║");
+  Serial.println("║ • SELECT: String select (short)        ║");
+  Serial.println("║           Mode select (long 800ms)     ║");
+  Serial.println("║           Settings (very long 2s)      ║");
   Serial.println("╚════════════════════════════════════════╝\n");
   
-  Serial.println("BUTTON GUIDE:");
-  Serial.println("  • POWER: Stats (short) / Off (long 2s)");
-  Serial.println("  • START: Tune (short) / Auto All (long 1s)");
-  Serial.println("  • STRING SEL: Choose string mode");
-  Serial.println("  • MODE: Select mode / Settings (long 1.5s)");
-  Serial.println("\n🎸 Ready to tune with PIEZO sensor!\n");
-  Serial.println("NOTE: Pluck strings directly for best results");
-  Serial.println("Monitoring signal level...\n");
+  Serial.println("🎸 Ready to tune!\n");
 }
 
 // ===== MAIN LOOP =====
 
 void loop() {
   readSinglePiezoValue();
-
   handleButtons();
   
-  // Battery simulation (slowly decrease)
   static unsigned long lastBatteryUpdate = 0;
-  if (millis() - lastBatteryUpdate > 60000) {  // Every minute
+  if (millis() - lastBatteryUpdate > 60000) {
     if (batteryLevel > 0) batteryLevel--;
     lastBatteryUpdate = millis();
   }
@@ -1431,10 +1384,8 @@ void loop() {
   if (currentState == STATE_TUNING || currentState == STATE_AUTO_TUNE_ALL) {
     attachServoIfNeeded();
     
-    // Check if success animation should complete
     checkSuccessAnimationComplete();
     
-    // Don't process audio if showing success animation
     if (!showSuccessAnimation) {
       captureSamples();
       preprocessSignal();
@@ -1443,7 +1394,6 @@ void loop() {
       String note = "--";
       int cents = 0;
 
-      // Lower threshold for piezo - they tend to have better SNR
       if (signalLevel > 5.0f) {
         float raw = findPeakFrequency();
         freq = smoothFreq(raw);
@@ -1462,7 +1412,6 @@ void loop() {
       }
     }
     
-    // Draw success animation if active (outside the audio processing block)
     if (showSuccessAnimation) {
       drawSuccessAnimation();
     }
