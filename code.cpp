@@ -15,8 +15,8 @@
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
 // ===== BUTTONS (PCB PINOUT) - ACTIVE HIGH =====
-#define BTN_TOGGLE    15
-#define BTN_SELECT    46
+#define BTN_TOGGLE    46
+#define BTN_SELECT    3
 
 // Button state tracking (active HIGH: pressed=HIGH, released=LOW)
 bool lastButtonState[2] = {LOW, LOW};
@@ -30,7 +30,7 @@ const int PIEZO_PIN = 2;
 const int SERVO_PIN = 45;
 
 // ===== FFT Configuration =====
-const uint16_t SAMPLES = 2048;
+const uint16_t SAMPLES = 4096;
 const double SAMPLING_FREQ = 8192;
 ArduinoFFT<double> FFT = ArduinoFFT<double>();
 double *vReal;
@@ -74,17 +74,17 @@ struct TuningDef {
 
 TuningDef tuningModes[] = {
   {"STANDARD", {82.41, 110.0, 146.83, 196.0, 246.94, 329.63}},
-  {"1/2 STEP DOWN", {77.78, 103.83, 138.59, 185.0, 233.08, 311.13}},
-  {"1/2 STEP UP", {87.31, 116.54, 155.56, 207.65, 261.63, 349.23}},
-  {"FULL STEP DOWN", {73.42, 98.0, 130.81, 174.61, 220.0, 293.66}}
+  {"Eb Standard", {77.78, 103.83, 138.59, 185.0, 233.08, 311.13}},
+  {"DADGAD", {73.42, 110.10, 146.83, 196.00, 220.0, 293.66}},
+  {"Open G", {73.42, 98.0, 146.83, 196.00, 246.94, 293.66}}
 };
 
 const char* STRING_NAMES[] = {"E2", "A2", "D3", "G3", "B3", "E4"};
 
 // Analysis settings
 const float F_MIN = 70.0f;
-const float F_MAX = 1000.0f;
-const float NOISE_THRESHOLD = 15.0;
+const float F_MAX = 350.0f;
+const float NOISE_THRESHOLD = 12.0;
 int TUNE_TOLERANCE = 5;
 
 // Smoothing
@@ -159,7 +159,7 @@ int batteryLevel = 100;
 #define COLOR_GOLD      0xFEA0
 
 // ===== PIEZO CALIBRATION =====
-float PIEZO_GAIN_ADJUST = 1.0;
+float PIEZO_GAIN_ADJUST = 1.5;
 bool USE_DC_BLOCK = true;
 
 // ===== UI HELPER FUNCTIONS =====
@@ -175,6 +175,8 @@ void drawProgressBar(int x, int y, int w, int h, int value, int maxValue, uint16
     tft.fillRoundRect(x + 2, y + 2, fillWidth, h - 4, 2, color);
   }
 }
+
+
 
 void drawCentsMeter(int x, int y, int w, int h, int cents) {
   tft.fillRoundRect(x, y, w, h, 6, COLOR_CARD);
@@ -751,8 +753,8 @@ void updateTuningScreen(float freq, const String& note, int cents) {
 // ===== BUTTON HANDLING - ACTIVE HIGH, NO DEBOUNCE =====
 
 void initButtons() {
-  pinMode(BTN_TOGGLE, INPUT);  // Active HIGH with external pull-down
-  pinMode(BTN_SELECT, INPUT);  // Active HIGH with external pull-down
+  pinMode(BTN_TOGGLE, INPUT_PULLUP);  // Active HIGH with external pull-down
+  pinMode(BTN_SELECT, INPUT_PULLUP);  // Active HIGH with external pull-down
   
   // Debug: Print initial button states
   Serial.println("Button init - reading initial states:");
@@ -769,14 +771,14 @@ int readButtonPress(int buttonIndex, int pin) {
   int result = 0;
   
   // Button just pressed (LOW -> HIGH)
-  if (currentState == HIGH && lastButtonState[buttonIndex] == LOW) {
+  if (currentState == LOW && lastButtonState[buttonIndex] == HIGH) {
     buttonPressStart[buttonIndex] = millis();
     buttonLongPressTriggered[buttonIndex] = false;
     Serial.printf("Button %d PRESSED\n", buttonIndex);
   }
   
   // Button just released (HIGH -> LOW)
-  if (currentState == LOW && lastButtonState[buttonIndex] == HIGH) {
+  if (currentState == HIGH && lastButtonState[buttonIndex] == LOW) {
     unsigned long duration = millis() - buttonPressStart[buttonIndex];
     Serial.printf("Button %d RELEASED after %lu ms\n", buttonIndex, duration);
     
@@ -792,7 +794,7 @@ int readButtonPress(int buttonIndex, int pin) {
   }
   
   // Check for long press while holding
-  if (currentState == HIGH && !buttonLongPressTriggered[buttonIndex]) {
+  if (currentState == LOW && !buttonLongPressTriggered[buttonIndex]) {
     unsigned long duration = millis() - buttonPressStart[buttonIndex];
     
     if (duration >= 2000) {
@@ -1317,16 +1319,17 @@ void setup() {
   // Set rotation - try 1 first, if mirrored horizontally, we'll fix with sendCommand
   tft.setRotation(1);
   
+  
   // If still mirrored, uncomment ONE of these to flip horizontally:
   // Option A: Use rotation 3 with inverted colors
-  // tft.setRotation(3);
+  // tft.setRotation(1);
   // tft.invertDisplay(true);
   
   // Option B: Direct MADCTL command to mirror X axis
   // MADCTL values for ST7789: 0x00=normal, 0x40=mirror Y, 0x80=mirror X, 0xC0=mirror both
   // For landscape with X mirror: try 0xA0 or 0x60
   tft.sendCommand(0x36);  // MADCTL command
-  tft.sendCommand(0x70);  // Try: 0x70, 0xA0, 0x60, 0xE0 - one should work
+  tft.sendCommand(0x80);  // Try: 0x70, 0xA0, 0x60, 0xE0 - one should work
   
   tft.fillScreen(COLOR_BG);
   Serial.println("✓ ST7789 Display initialized");
