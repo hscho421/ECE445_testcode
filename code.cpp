@@ -36,6 +36,20 @@ ArduinoFFT<double> FFT = ArduinoFFT<double>();
 double *vReal;
 double *vImag;
 
+// ===== STABLE PITCH TRACKING =====
+const int FREQ_STABLE_WINDOW = 5;          // how many frames must agree
+const float FREQ_STABLE_CENTS = 6.0f;      // max spread within window
+const float SIGNAL_START_THRESHOLD = 10.0; // when we start tracking a pluck
+const float SIGNAL_END_THRESHOLD   = 4.0;  // when we consider pluck finished
+const unsigned long HOLD_AFTER_SILENCE = 400; // ms to keep last pitch
+
+float candidateFreqs[FREQ_STABLE_WINDOW] = {0};
+int candidateIdx = 0;
+bool haveStableFreq = false;
+float stableFreq = 0.0f;
+unsigned long lastLoudTime = 0;
+
+
 // ===== SYSTEM STATES =====
 enum SystemState {
   STATE_OFF,
@@ -1023,6 +1037,10 @@ void preprocessSignal() {
     Serial.println(signalLevel);
     lastPrint = millis();
   }
+  ///////////////////////////////////////////
+  if (signalLevel > SIGNAL_START_THRESHOLD) {
+    lastLoudTime = millis();
+  }
 }
 
 float findPeakFrequency() {
@@ -1082,6 +1100,58 @@ float smoothFreq(float f) {
   }
   return c ? sum / c : 0.0f;
 }
+//////////////////////////////////////////////////////////
+float updateStableFrequency(float f) {
+  // If no valid candidate this frame, just return last stable pitch (if any)
+  if (f <= 0) {
+    if (haveStableFreq && (millis() - lastLoudTime) < HOLD_AFTER_SILENCE) {
+      return stableFreq;
+    } else {
+      haveStableFreq = false;
+      stableFreq = 0.0f;
+      return 0.0f;
+    }
+  }
+
+  // Store candidate in circular buffer
+  candidateFreqs[candidateIdx] = f;
+  candidateIdx = (candidateIdx + 1) % FREQ_STABLE_WINDOW;
+
+  // Count how many non-zero entries we have
+  int count = 0;
+  for (int i = 0; i < FREQ_STABLE_WINDOW; i++) {
+    if (candidateFreqs[i] > 0) count++;
+  }
+  if (count < FREQ_STABLE_WINDOW) {
+    // Not enough data yet – keep accumulating
+    return haveStableFreq ? stableFreq : 0.0f;
+  }
+
+  // Compute mean frequency of the window
+  float sum = 0.0f;
+  for (int i = 0; i < FREQ_STABLE_WINDOW; i++) {
+    sum += candidateFreqs[i];
+  }
+  float meanFreq = sum / FREQ_STABLE_WINDOW;
+
+  // Compute spread in cents relative to the mean
+  float varCents = 0.0f;
+  for (int i = 0; i < FREQ_STABLE_WINDOW; i++) {
+    float cents = 1200.0f * log2f(candidateFreqs[i] / meanFreq);
+    varCents += cents * cents;
+  }
+  float stdCents = sqrtf(varCents / FREQ_STABLE_WINDOW);
+
+  // If all candidates are close in pitch → accept as stable
+  if (stdCents < FREQ_STABLE_CENTS) {
+    stableFreq = meanFreq;
+    haveStableFreq = true;
+  }
+
+  return haveStableFreq ? stableFreq : 0.0f;
+}
+
+//////////////////////////////////////////////////////////////
 
 int identifyString(float f) {
   if (f <= 0) return -1;
@@ -1317,7 +1387,7 @@ void setup() {
   tft.invertDisplay(false);
   
   // Set rotation - try 1 first, if mirrored horizontally, we'll fix with sendCommand
-  tft.setRotation(1);
+  tft.setRotation(3);
   
   
   // If still mirrored, uncomment ONE of these to flip horizontally:
@@ -1328,9 +1398,18 @@ void setup() {
   // Option B: Direct MADCTL command to mirror X axis
   // MADCTL values for ST7789: 0x00=normal, 0x40=mirror Y, 0x80=mirror X, 0xC0=mirror both
   // For landscape with X mirror: try 0xA0 or 0x60
-  tft.sendCommand(0x36);  // MADCTL command
-  tft.sendCommand(0x80);  // Try: 0x70, 0xA0, 0x60, 0xE0 - one should work
+//   tft.sendCommand(0x36);  // MADCTL command
+//   tft.sendCommand(0x80);  // Try: 0x70, 0xA0, 0x60, 0xE0 - one should work
   
+//   tft.fillScreen(COLOR_BG);
+
+// --- FIX: override MADCTL to un-mirror the image ---
+  uint8_t madctl = ST77XX_MADCTL_MV | ST77XX_MADCTL_RGB;
+//  - MV: swap X/Y for landscape
+//  - RGB: normal color order, no mirroring bits set
+  tft.sendCommand(ST77XX_MADCTL, &madctl, 1);
+// -------------------------------------------
+
   tft.fillScreen(COLOR_BG);
   Serial.println("✓ ST7789 Display initialized");
   
@@ -1381,20 +1460,47 @@ void loop() {
       captureSamples();
       preprocessSignal();
 
+    //   float freq = 0.0f;
+    //   String note = "--";
+    //   int cents = 0;
+
+    //   if (signalLevel > 5.0f) {
+    //     float raw = findPeakFrequency();
+    //     freq = smoothFreq(raw);
+    //     freqToNote(freq, note, cents);
+        
+    //     int stringNum = identifyString(freq);
+    //     if (stringNum >= 0 && freq > 0) {
+    //       updateServoFromCents(cents);
+    //     }
+    //   }
+
       float freq = 0.0f;
       String note = "--";
       int cents = 0;
 
-      if (signalLevel > 5.0f) {
+      // Only try to extract a new candidate freq when the signal is loud enough
+      float candidate = 0.0f;
+      if (signalLevel > SIGNAL_START_THRESHOLD) {
         float raw = findPeakFrequency();
-        freq = smoothFreq(raw);
+        candidate = smoothFreq(raw);   // optional extra smoothing
+      }
+
+      // Let the stable-frequency tracker decide what pitch to use
+      freq = updateStableFrequency(candidate);
+
+      if (freq > 0.0f) {
         freqToNote(freq, note, cents);
-        
+
         int stringNum = identifyString(freq);
-        if (stringNum >= 0 && freq > 0) {
+        if (stringNum >= 0) {
           updateServoFromCents(cents);
         }
+      } else {
+        note = "--";
+        cents = 0;
       }
+
 
       if (currentState == STATE_TUNING) {
         updateTuningScreen(freq, note, cents);
