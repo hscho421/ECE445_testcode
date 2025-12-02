@@ -1,38 +1,33 @@
 #include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>  // Changed from Adafruit_ILI9341.h
+#include <Adafruit_ST7789.h>
 #include <SPI.h>
 #include <arduinoFFT.h>
 #include <ESP32Servo.h>
 
 // ===== TFT DISPLAY (PCB PINOUT - ST7789 Waveshare 2.4") =====
-#define TFT_MOSI  11  // D_IN / SDA
-#define TFT_CLK   12  // CLK / SCL
-#define TFT_CS    8   // CS
-#define TFT_DC    7   // DC
-#define TFT_RST   6   // RST
-#define TFT_BL    10  // Backlight
+#define TFT_MOSI  11
+#define TFT_CLK   12
+#define TFT_CS    8
+#define TFT_DC    7
+#define TFT_RST   6
+#define TFT_BL    10
 
-// ST7789 constructor - note: 240x320 are the native dimensions
-// We'll use rotation to get 320x240 landscape
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
-// ===== BUTTONS (PCB PINOUT) =====
-#define BTN_TOGGLE    15  // IO3 - Main action button
-#define BTN_SELECT    46  // IO46 - Selection/navigation button
+// ===== BUTTONS (PCB PINOUT) - ACTIVE HIGH =====
+#define BTN_TOGGLE    15
+#define BTN_SELECT    46
 
-// Button debouncing and press detection
-unsigned long lastDebounceTime[2] = {0, 0};
-const unsigned long debounceDelay = 50;
+// Button state tracking (active HIGH: pressed=HIGH, released=LOW)
 bool lastButtonState[2] = {LOW, LOW};
-bool buttonState[2] = {LOW, LOW};
 unsigned long buttonPressStart[2] = {0, 0};
 bool buttonLongPressTriggered[2] = {false, false};
 
 // ===== PIEZO SENSOR (PCB PINOUT) =====
-const int PIEZO_PIN = 2;  // IO2 - ADC input from amplifier
+const int PIEZO_PIN = 2;
 
 // ===== SERVO MOTOR (PCB PINOUT) =====
-const int SERVO_PIN = 45;  // IO45 - PWM signal to motor
+const int SERVO_PIN = 45;
 
 // ===== FFT Configuration =====
 const uint16_t SAMPLES = 2048;
@@ -151,7 +146,6 @@ const unsigned long SUCCESS_DISPLAY_TIME = 3000;
 int batteryLevel = 100;
 
 // ===== COLOR SCHEME =====
-// ST7789 uses the same 16-bit RGB565 format as ILI9341
 #define COLOR_BG        0x0841
 #define COLOR_CARD      0x1082
 #define COLOR_PRIMARY   0x07FF
@@ -754,77 +748,78 @@ void updateTuningScreen(float freq, const String& note, int cents) {
   tft.print(" c");
 }
 
-// ===== BUTTON HANDLING (2-BUTTON SYSTEM) =====
+// ===== BUTTON HANDLING - ACTIVE HIGH, NO DEBOUNCE =====
 
 void initButtons() {
-  pinMode(BTN_TOGGLE, INPUT);
-  pinMode(BTN_SELECT, INPUT);
+  pinMode(BTN_TOGGLE, INPUT);  // Active HIGH with external pull-down
+  pinMode(BTN_SELECT, INPUT);  // Active HIGH with external pull-down
+  
+  // Debug: Print initial button states
+  Serial.println("Button init - reading initial states:");
+  Serial.print("  TOGGLE (IO15): ");
+  Serial.println(digitalRead(BTN_TOGGLE) ? "HIGH" : "LOW");
+  Serial.print("  SELECT (IO46): ");
+  Serial.println(digitalRead(BTN_SELECT) ? "HIGH" : "LOW");
 }
 
-bool readButton(int buttonIndex, int pin, bool &longPress, bool &veryLongPress) {
-  bool reading = digitalRead(pin);  // HIGH = pressed, LOW = released
-  longPress = false;
-  veryLongPress = false;
+// Simplified button reading for ACTIVE HIGH buttons
+// Returns: 0=no press, 1=short press, 2=long press, 3=very long press
+int readButtonPress(int buttonIndex, int pin) {
+  bool currentState = digitalRead(pin);  // HIGH = pressed
+  int result = 0;
   
-  // Detect press start (LOW -> HIGH transition)
-  if (reading == HIGH && lastButtonState[buttonIndex] == LOW) {
+  // Button just pressed (LOW -> HIGH)
+  if (currentState == HIGH && lastButtonState[buttonIndex] == LOW) {
     buttonPressStart[buttonIndex] = millis();
     buttonLongPressTriggered[buttonIndex] = false;
+    Serial.printf("Button %d PRESSED\n", buttonIndex);
   }
   
-  bool pressed = false;
-  
-  // Detect release (HIGH -> LOW transition)
-  if (reading == LOW && lastButtonState[buttonIndex] == HIGH) {
-    unsigned long pressDuration = millis() - buttonPressStart[buttonIndex];
+  // Button just released (HIGH -> LOW)
+  if (currentState == LOW && lastButtonState[buttonIndex] == HIGH) {
+    unsigned long duration = millis() - buttonPressStart[buttonIndex];
+    Serial.printf("Button %d RELEASED after %lu ms\n", buttonIndex, duration);
     
     if (!buttonLongPressTriggered[buttonIndex]) {
-      if (pressDuration >= 2000) {
-        veryLongPress = true;
-        pressed = true;
-      } else if (pressDuration >= 800) {
-        longPress = true;
-        pressed = true;
-      } else {
-        pressed = true;  // Short press
+      if (duration >= 2000) {
+        result = 3;  // Very long press
+      } else if (duration >= 800) {
+        result = 2;  // Long press
+      } else if (duration >= 50) {  // Minimum 50ms to filter noise
+        result = 1;  // Short press
       }
     }
   }
   
-  // Check for long press while still holding
-  if (reading == HIGH && !buttonLongPressTriggered[buttonIndex]) {
-    unsigned long pressDuration = millis() - buttonPressStart[buttonIndex];
+  // Check for long press while holding
+  if (currentState == HIGH && !buttonLongPressTriggered[buttonIndex]) {
+    unsigned long duration = millis() - buttonPressStart[buttonIndex];
     
-    if (pressDuration >= 2000) {
-      veryLongPress = true;
+    if (duration >= 2000) {
       buttonLongPressTriggered[buttonIndex] = true;
-      pressed = true;
-    } else if (pressDuration >= 800) {
-      longPress = true;
+      result = 3;
+      Serial.printf("Button %d VERY LONG PRESS triggered\n", buttonIndex);
+    } else if (duration >= 800) {
       buttonLongPressTriggered[buttonIndex] = true;
-      pressed = true;
+      result = 2;
+      Serial.printf("Button %d LONG PRESS triggered\n", buttonIndex);
     }
   }
   
-  lastButtonState[buttonIndex] = reading;
-  return pressed;
+  lastButtonState[buttonIndex] = currentState;
+  return result;
 }
 
 void handleButtons() {
-  bool toggleLongPress = false;
-  bool toggleVeryLongPress = false;
-  bool selectLongPress = false;
-  bool selectVeryLongPress = false;
-  
-  bool togglePressed = readButton(0, BTN_TOGGLE, toggleLongPress, toggleVeryLongPress);
-  bool selectPressed = readButton(1, BTN_SELECT, selectLongPress, selectVeryLongPress);
+  int toggleAction = readButtonPress(0, BTN_TOGGLE);
+  int selectAction = readButtonPress(1, BTN_SELECT);
   
   // TOGGLE BUTTON LOGIC
-  if (togglePressed) {
-    if (toggleVeryLongPress) {
-      // Very long press (2s+) - Power off from any state
+  if (toggleAction > 0) {
+    if (toggleAction == 3) {
+      // Very long press (2s+) - Power off
       currentState = STATE_OFF;
-      tft.fillScreen(ST77XX_BLACK);  // Changed from ILI9341_BLACK
+      tft.fillScreen(ST77XX_BLACK);
       if (servoAttached) {
         servoPos = 90;
         tunerServo.write(servoPos);
@@ -834,8 +829,8 @@ void handleButtons() {
       }
       Serial.println("System OFF");
       
-    } else if (toggleLongPress) {
-      // Long press (800ms) - Auto tune all (from standby only)
+    } else if (toggleAction == 2) {
+      // Long press (800ms) - Auto tune all
       if (currentState == STATE_STANDBY) {
         currentState = STATE_AUTO_TUNE_ALL;
         autoTuneInProgress = true;
@@ -851,10 +846,9 @@ void handleButtons() {
         Serial.println("AUTO TUNE ALL started");
       }
       
-    } else {
-      // Short press - Main action button
+    } else if (toggleAction == 1) {
+      // Short press
       if (currentState == STATE_OFF) {
-        // Power on
         currentState = STATE_STANDBY;
         stats.sessionStartTime = millis();
         stats.sessionStringsTuned = 0;
@@ -862,7 +856,6 @@ void handleButtons() {
         Serial.println("System ON");
         
       } else if (currentState == STATE_STANDBY) {
-        // Start tuning
         currentState = STATE_TUNING;
         drawTuningScreen();
         stableCount = 0;
@@ -874,7 +867,6 @@ void handleButtons() {
         Serial.println("Tuning started");
         
       } else if (currentState == STATE_TUNING || currentState == STATE_AUTO_TUNE_ALL) {
-        // Stop tuning
         currentState = STATE_STANDBY;
         autoTuneInProgress = false;
         servoPos = 90;
@@ -895,20 +887,12 @@ void handleButtons() {
         drawStandbyScreen();
         Serial.println("Tuning stopped");
         
-      } else if (currentState == STATE_STRING_SELECT) {
-        // Confirm string selection
+      } else if (currentState == STATE_STRING_SELECT || currentState == STATE_MODE_SELECT) {
         currentState = STATE_STANDBY;
         drawStandbyScreen();
-        Serial.println("String selection confirmed");
-        
-      } else if (currentState == STATE_MODE_SELECT) {
-        // Confirm mode selection
-        currentState = STATE_STANDBY;
-        drawStandbyScreen();
-        Serial.println("Mode selection confirmed");
+        Serial.println("Selection confirmed");
         
       } else {
-        // Return to standby from other screens
         currentState = STATE_STANDBY;
         drawStandbyScreen();
       }
@@ -916,8 +900,8 @@ void handleButtons() {
   }
   
   // SELECT BUTTON LOGIC
-  if (selectPressed) {
-    if (selectVeryLongPress) {
+  if (selectAction > 0) {
+    if (selectAction == 3) {
       // Very long press (2s+) - Settings
       if (currentState == STATE_STANDBY) {
         currentState = STATE_SETTINGS;
@@ -925,28 +909,25 @@ void handleButtons() {
         Serial.println("Entered settings");
       }
       
-    } else if (selectLongPress) {
-      // Long press (800ms) - Mode select or Statistics
+    } else if (selectAction == 2) {
+      // Long press (800ms) - Mode select
       if (currentState == STATE_STANDBY) {
         currentState = STATE_MODE_SELECT;
         drawModeSelectScreen();
         Serial.println("Mode selection");
       } else if (currentState == STATE_TUNING || currentState == STATE_AUTO_TUNE_ALL) {
-        // Show statistics while tuning
-        SystemState prevState = currentState;
         currentState = STATE_STATISTICS;
         drawStatisticsScreen();
       }
       
-    } else {
-      // Short press - String selection or cycle
+    } else if (selectAction == 1) {
+      // Short press
       if (currentState == STATE_STANDBY) {
         currentState = STATE_STRING_SELECT;
         drawStringSelectScreen();
         Serial.println("String selection");
         
       } else if (currentState == STATE_STRING_SELECT) {
-        // Cycle through strings
         if (isAutoMode) {
           isAutoMode = false;
           selectedString = 0;
@@ -961,13 +942,11 @@ void handleButtons() {
         Serial.printf("String: %s\n", isAutoMode ? "AUTO" : STRING_NAMES[selectedString]);
         
       } else if (currentState == STATE_MODE_SELECT) {
-        // Cycle through modes
         tuningMode = (TuningMode)((tuningMode + 1) % 4);
         drawModeSelectScreen();
         Serial.printf("Mode: %s\n", tuningModes[tuningMode].name);
         
       } else if (currentState == STATE_STATISTICS || currentState == STATE_SETTINGS) {
-        // Return to standby
         currentState = STATE_STANDBY;
         drawStandbyScreen();
       }
@@ -990,6 +969,12 @@ void readSinglePiezoValue() {
     Serial.print(" / 4095 (");
     Serial.print(voltage, 3);
     Serial.println(" V)");
+    
+    // Also print button states for debugging
+    Serial.print("Buttons - TOGGLE: ");
+    Serial.print(digitalRead(BTN_TOGGLE) ? "HIGH" : "LOW");
+    Serial.print(" | SELECT: ");
+    Serial.println(digitalRead(BTN_SELECT) ? "HIGH" : "LOW");
     Serial.println("═══════════════════════════════════");
     
     lastReadTime = currentTime;
@@ -1304,7 +1289,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("\n\n╔════════════════════════════════════════╗");
-  Serial.println("║  AUTO GUITAR TUNER - ST7789 v1.0       ║");
+  Serial.println("║  AUTO GUITAR TUNER - ST7789 v1.1       ║");
   Serial.println("╚════════════════════════════════════════╝\n");
 
   vReal = (double*)malloc(SAMPLES * sizeof(double));
@@ -1319,23 +1304,32 @@ void setup() {
   analogSetAttenuation(ADC_11db);
   Serial.println("✓ ADC configured (IO2)");
 
-  // Configure SPI with custom pins for ST7789
+  // Configure SPI
   SPI.begin(TFT_CLK, -1, TFT_MOSI, TFT_CS);
   delay(100);
   
-  // ST7789 initialization - Waveshare 2.4" is 240x320
-  // init() takes width and height parameters
+  // ST7789 initialization
   tft.init(240, 320);
-  tft.invertDisplay(false);  
-
   
-  // Set rotation for landscape mode (320x240)
-  // You may need to adjust this (0-3) depending on your mounting orientation
-  // Rotation 1 or 3 gives landscape; try both to see which orientation works
-  tft.setRotation(2);
+  // Fix color inversion
+  tft.invertDisplay(false);
+  
+  // Set rotation - try 1 first, if mirrored horizontally, we'll fix with sendCommand
+  tft.setRotation(1);
+  
+  // If still mirrored, uncomment ONE of these to flip horizontally:
+  // Option A: Use rotation 3 with inverted colors
+  // tft.setRotation(3);
+  // tft.invertDisplay(true);
+  
+  // Option B: Direct MADCTL command to mirror X axis
+  // MADCTL values for ST7789: 0x00=normal, 0x40=mirror Y, 0x80=mirror X, 0xC0=mirror both
+  // For landscape with X mirror: try 0xA0 or 0x60
+  tft.sendCommand(0x36);  // MADCTL command
+  tft.sendCommand(0x70);  // Try: 0x70, 0xA0, 0x60, 0xE0 - one should work
   
   tft.fillScreen(COLOR_BG);
-  Serial.println("✓ ST7789 Display initialized (240x320)");
+  Serial.println("✓ ST7789 Display initialized");
   
   // Enable backlight
   pinMode(TFT_BL, OUTPUT);
@@ -1343,7 +1337,8 @@ void setup() {
   Serial.println("✓ Backlight enabled");
 
   initButtons();
-  Serial.println("✓ Buttons initialized (IO15, IO46)");
+  Serial.println("✓ Buttons initialized (ACTIVE HIGH)");
+  Serial.println("  IO15 = TOGGLE, IO46 = SELECT");
 
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
@@ -1356,25 +1351,10 @@ void setup() {
   
   drawStandbyScreen();
   
-  Serial.println("\n╔════════════════════════════════════════╗");
-  Serial.println("║         PCB CONFIGURATION              ║");
-  Serial.println("╠════════════════════════════════════════╣");
-  Serial.println("║ Display: ST7789 Waveshare 2.4\"         ║");
-  Serial.println("║ Pins: IO11,12,8,7,6,10                 ║");
-  Serial.println("║ Buttons: IO15 (Toggle), IO46 (Select)  ║");
-  Serial.println("║ Servo: IO45                            ║");
-  Serial.println("║ Piezo: IO2                             ║");
-  Serial.println("╠════════════════════════════════════════╣");
-  Serial.println("║ BUTTON GUIDE:                          ║");
-  Serial.println("║ • TOGGLE: Start/Stop (short)           ║");
-  Serial.println("║           Auto All (long 800ms)        ║");
-  Serial.println("║           Power Off (very long 2s)     ║");
-  Serial.println("║ • SELECT: String select (short)        ║");
-  Serial.println("║           Mode select (long 800ms)     ║");
-  Serial.println("║           Settings (very long 2s)      ║");
-  Serial.println("╚════════════════════════════════════════╝\n");
-  
-  Serial.println("🎸 Ready to tune!\n");
+  Serial.println("\n════════════════════════════════════════");
+  Serial.println("BUTTON DEBUG: Watch Serial Monitor");
+  Serial.println("Press buttons - you should see HIGH/LOW");
+  Serial.println("════════════════════════════════════════\n");
 }
 
 // ===== MAIN LOOP =====
