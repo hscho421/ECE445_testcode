@@ -1332,7 +1332,7 @@ void setup() {
   // Set rotation for landscape mode (320x240)
   // You may need to adjust this (0-3) depending on your mounting orientation
   // Rotation 1 or 3 gives landscape; try both to see which orientation works
-  tft.setRotation(1);
+  tft.setRotation(2);
   
   tft.fillScreen(COLOR_BG);
   Serial.println("✓ ST7789 Display initialized (240x320)");
