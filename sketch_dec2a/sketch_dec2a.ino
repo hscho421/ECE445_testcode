@@ -2,6 +2,7 @@
 #include <Adafruit_ST7789.h>
 #include <SPI.h>
 #include <ESP32Servo.h>
+#include <math.h>
 
 // ===== TFT DISPLAY =====
 #define TFT_MOSI  11
@@ -28,19 +29,19 @@ const int PIEZO_PIN = 2;
 const int SERVO_PIN = 45;
 
 // ===== AUTOCORRELATION CONFIG =====
-const uint16_t SAMPLES = 1024;  // Smaller buffer = faster
-const double SAMPLING_FREQ = 4096.0;  // Lower sample rate for guitar range
-int16_t *sampleBuffer;  // Use int16 instead of double to save memory
+const uint16_t SAMPLES = 1024;
+const double SAMPLING_FREQ = 8192.0;
+int16_t *sampleBuffer;
 
 // Frequency range for guitar (E2=82Hz to E4=330Hz)
 const float F_MIN = 75.0f;
-const float F_MAX = 350.0f;
-const float NOISE_THRESHOLD = 50.0f;  // Minimum signal amplitude
+const float F_MAX = 450.0f;
+float NOISE_THRESHOLD = 4.0f;   // more sensitive for high strings
 
 // ===== PITCH TRACKING =====
 float lastValidFreq = 0.0f;
 unsigned long lastValidTime = 0;
-const unsigned long HOLD_TIME = 300;  // Hold last pitch for 300ms
+const unsigned long HOLD_TIME = 300;
 
 // ===== SYSTEM STATES =====
 enum SystemState {
@@ -70,16 +71,16 @@ struct TuningDef {
 };
 
 TuningDef tuningModes[] = {
-  {"STANDARD", {82.41, 110.0, 146.83, 196.0, 246.94, 329.63}},
+  {"STANDARD",    {82.41, 110.0, 146.83, 196.0, 246.94, 329.63}},
   {"Eb Standard", {77.78, 103.83, 138.59, 185.0, 233.08, 311.13}},
-  {"Drop D", {73.42, 110.0, 146.83, 196.0, 246.94, 329.63}},
-  {"Open G", {73.42, 98.0, 146.83, 196.0, 246.94, 293.66}}
+  {"Drop D",      {73.42, 110.0, 146.83, 196.0, 246.94, 329.63}},
+  {"Open G",      {73.42, 98.0, 146.83, 196.0, 246.94, 293.66}}
 };
 
 const char* STRING_NAMES[] = {"E2", "A2", "D3", "G3", "B3", "E4"};
-const char* NOTE_NAMES[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+const char* NOTE_NAMES[]   = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
 
-int TUNE_TOLERANCE = 5;
+int TUNE_TOLERANCE = 10;
 float signalLevel = 0;
 unsigned long currentTuneStartTime = 0;
 
@@ -92,6 +93,11 @@ uint32_t SERVO_MOVE_PERIOD = 150;
 bool servoAttached = false;
 
 int lastCents = 0;
+
+// ===== IN TUNE STABILITY =====
+unsigned long inTuneStartTime = 0;
+bool wasInTune = false;
+const unsigned long IN_TUNE_DURATION = 500;
 
 bool servoIsMoving = false;
 unsigned long servoMoveStartTime = 0;
@@ -113,18 +119,31 @@ const unsigned long SUCCESS_DISPLAY_TIME = 2000;
 #define COLOR_TEXT      0xFFFF
 #define COLOR_TEXT_DIM  0x8410
 
-// ===== AUTOCORRELATION PITCH DETECTION =====
+// ===== SAMPLE CAPTURE =====
 
 void captureSamples() {
-  // Fast sample capture
   unsigned long periodUs = 1000000UL / (unsigned long)SAMPLING_FREQ;
-  
+
   for (int i = 0; i < SAMPLES; i++) {
     unsigned long start = micros();
-    sampleBuffer[i] = analogRead(PIEZO_PIN) - 2048;  // Center around zero
+    sampleBuffer[i] = analogRead(PIEZO_PIN);
     while (micros() - start < periodUs);
   }
 }
+
+// Remove DC offset from current buffer
+void removeDC() {
+  int32_t sum = 0;
+  for (int i = 0; i < SAMPLES; i++) {
+    sum += sampleBuffer[i];
+  }
+  int16_t mean = sum / SAMPLES;
+  for (int i = 0; i < SAMPLES; i++) {
+    sampleBuffer[i] -= mean;
+  }
+}
+
+// ===== AUTOCORRELATION PITCH DETECTION =====
 
 float calculateSignalLevel() {
   int32_t sum = 0;
@@ -134,64 +153,100 @@ float calculateSignalLevel() {
   return (float)sum / SAMPLES;
 }
 
-float detectPitchAutocorrelation() {
-  // Calculate signal level first
+// expectedFreq can be 0 or negative if unknown
+float detectPitchAutocorrelation(float expectedFreq) {
+  removeDC();
+
   signalLevel = calculateSignalLevel();
-  
   if (signalLevel < NOISE_THRESHOLD) {
     return 0.0f;
   }
-  
-  // Autocorrelation-based pitch detection
-  // We look for the lag where the signal correlates best with itself
-  
-  int minLag = (int)(SAMPLING_FREQ / F_MAX);  // ~12 samples for 350Hz
-  int maxLag = (int)(SAMPLING_FREQ / F_MIN);  // ~55 samples for 75Hz
-  
-  // Limit maxLag to avoid going out of bounds
-  if (maxLag > SAMPLES / 2) maxLag = SAMPLES / 2;
-  
+
+  // Global lag bounds from full range
+  int globalMinLag = (int)(SAMPLING_FREQ / F_MAX);
+  int globalMaxLag = (int)(SAMPLING_FREQ / F_MIN);
+  if (globalMaxLag > SAMPLES / 2) globalMaxLag = SAMPLES / 2;
+  if (globalMinLag < 2) globalMinLag = 2;
+
+  int minLag = globalMinLag;
+  int maxLag = globalMaxLag;
+
+  // If we know which string we expect, narrow the lag search around it
+  if (expectedFreq > 0.0f) {
+    int centerLag = (int)(SAMPLING_FREQ / expectedFreq);
+    int localMin = (int)(centerLag * 0.5f);   // allow some detune low
+    int localMax = (int)(centerLag * 1.5f);   // and some detune high
+
+    if (localMin < globalMinLag) localMin = globalMinLag;
+    if (localMax > globalMaxLag) localMax = globalMaxLag;
+
+    minLag = localMin;
+    maxLag = localMax;
+  }
+
   int32_t maxCorr = 0;
   int bestLag = 0;
-  
-  // Calculate autocorrelation for each lag
+
   for (int lag = minLag; lag <= maxLag; lag++) {
     int32_t corr = 0;
-    
-    // Sum of products
     for (int i = 0; i < SAMPLES - lag; i++) {
       corr += (int32_t)sampleBuffer[i] * sampleBuffer[i + lag];
     }
-    
+
     if (corr > maxCorr) {
       maxCorr = corr;
       bestLag = lag;
     }
   }
-  
-  // Need a strong correlation
-  if (maxCorr < 1000000) {
+
+  if (bestLag == 0) return 0.0f;
+
+  float detectedFreq = SAMPLING_FREQ / (float)bestLag;
+
+  if (detectedFreq < F_MIN || detectedFreq > F_MAX) {
     return 0.0f;
   }
-  
-  // Parabolic interpolation for sub-sample accuracy
+
+  // Subharmonic check only if we are not already tightly locked by expectedFreq
+  if (detectedFreq > 150.0f && expectedFreq <= 0.0f) {
+    int doubleLag = bestLag * 2;
+    if (doubleLag <= globalMaxLag) {
+      int32_t corr2x = 0;
+      for (int i = 0; i < SAMPLES - doubleLag; i++) {
+        corr2x += (int32_t)sampleBuffer[i] * sampleBuffer[i + doubleLag];
+      }
+      if (corr2x > maxCorr * 0.6f) {
+        bestLag = doubleLag;
+        maxCorr = corr2x;
+        detectedFreq = SAMPLING_FREQ / (float)bestLag;
+      }
+    }
+  }
+
+  // Parabolic interpolation
   if (bestLag > minLag && bestLag < maxLag) {
-    int32_t corrPrev = 0, corrNext = 0;
-    
+    int32_t corrPrev = 0, corrCurr = maxCorr, corrNext = 0;
     for (int i = 0; i < SAMPLES - bestLag - 1; i++) {
       corrPrev += (int32_t)sampleBuffer[i] * sampleBuffer[i + bestLag - 1];
       corrNext += (int32_t)sampleBuffer[i] * sampleBuffer[i + bestLag + 1];
     }
-    
-    float delta = (float)(corrPrev - corrNext) / (2.0f * (corrPrev - 2.0f * maxCorr + corrNext));
-    float refinedLag = bestLag + delta;
-    
-    if (refinedLag > 0) {
-      return SAMPLING_FREQ / refinedLag;
+
+    float denom = 2.0f * (corrPrev - 2.0f * corrCurr + corrNext);
+    if (fabsf(denom) > 0.001f) {
+      float delta = (float)(corrPrev - corrNext) / denom;
+      delta = constrain(delta, -0.5f, 0.5f);
+      float refinedLag = bestLag + delta;
+      if (refinedLag > 0) {
+        detectedFreq = SAMPLING_FREQ / refinedLag;
+      }
     }
   }
-  
-  return SAMPLING_FREQ / (float)bestLag;
+
+  if (detectedFreq < F_MIN || detectedFreq > F_MAX) {
+    return 0.0f;
+  }
+
+  return detectedFreq;
 }
 
 // ===== UI HELPER FUNCTIONS =====
@@ -210,22 +265,22 @@ void drawCentsMeter(int y, int cents) {
   int meterWidth = 280;
   int meterHeight = 40;
   int x = (320 - meterWidth) / 2;
-  
+
   tft.fillRoundRect(x, y, meterWidth, meterHeight, 6, COLOR_CARD);
-  
+
   int centerX = x + meterWidth / 2;
   tft.drawFastVLine(centerX, y + 8, meterHeight - 16, COLOR_TEXT_DIM);
-  
+
   int tolerancePixels = map(TUNE_TOLERANCE, 0, 50, 0, meterWidth / 2);
   tft.fillRect(centerX - tolerancePixels, y + 4, tolerancePixels * 2, meterHeight - 8, 0x0320);
-  
+
   int c = constrain(cents, -50, 50);
   int indicatorX = centerX + map(c, -50, 50, -meterWidth/2 + 15, meterWidth/2 - 15);
-  
+
   uint16_t color = COLOR_SUCCESS;
   if (abs(cents) > TUNE_TOLERANCE && abs(cents) <= 15) color = COLOR_WARNING;
   else if (abs(cents) > 15) color = COLOR_DANGER;
-  
+
   tft.fillCircle(indicatorX, y + meterHeight/2, 12, color);
   tft.drawCircle(indicatorX, y + meterHeight/2, 13, COLOR_TEXT);
 }
@@ -236,11 +291,11 @@ void drawStringIndicator(int stringNum) {
   int spacing = 5;
   int totalWidth = 6 * boxWidth + 5 * spacing;
   int startX = (320 - totalWidth) / 2;
-  
+
   for (int i = 0; i < 6; i++) {
     int x = startX + i * (boxWidth + spacing);
     bool isSelected = (stringNum == i);
-    
+
     if (isSelected) {
       tft.fillRoundRect(x, y, boxWidth, 30, 4, COLOR_PRIMARY);
       tft.setTextColor(COLOR_BG);
@@ -248,7 +303,7 @@ void drawStringIndicator(int stringNum) {
       tft.fillRoundRect(x, y, boxWidth, 30, 4, COLOR_CARD);
       tft.setTextColor(COLOR_TEXT_DIM);
     }
-    
+
     tft.setTextSize(1);
     int16_t x1, y1;
     uint16_t w, h;
@@ -262,9 +317,9 @@ void drawStringIndicator(int stringNum) {
 
 void drawStandbyScreen() {
   tft.fillScreen(COLOR_BG);
-  
+
   drawCenteredText("GUITAR TUNER", 30, 3, COLOR_PRIMARY);
-  
+
   tft.fillRoundRect(20, 80, 280, 50, 8, COLOR_CARD);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
@@ -274,7 +329,7 @@ void drawStandbyScreen() {
   tft.setTextColor(COLOR_TEXT);
   tft.setCursor(30, 105);
   tft.print(tuningModes[tuningMode].name);
-  
+
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
   tft.setCursor(180, 90);
@@ -284,7 +339,7 @@ void drawStandbyScreen() {
   tft.setCursor(180, 105);
   if (isAutoMode) tft.print("AUTO");
   else tft.print(STRING_NAMES[selectedString]);
-  
+
   tft.fillRoundRect(20, 150, 280, 70, 8, COLOR_CARD);
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT);
@@ -299,27 +354,25 @@ void drawStandbyScreen() {
 
 void drawTuningScreen() {
   tft.fillScreen(COLOR_BG);
-  
+
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
   tft.setCursor(10, 10);
   tft.print(tuningModes[tuningMode].name);
-  
+
   tft.setTextColor(COLOR_SUCCESS);
   tft.setCursor(260, 10);
   tft.print("TUNING");
-  
+
   drawStringIndicator(-1);
 }
 
 void updateTuningDisplay(float freq, const String& note, int cents, int stringNum) {
   drawStringIndicator(stringNum);
-  
-  // Clear the entire note and frequency area
+
   tft.fillRect(20, 85, 280, 75, COLOR_BG);
-  
+
   if (freq > 0) {
-    // Large note display - centered
     tft.setTextSize(5);
     tft.setTextColor(COLOR_TEXT);
     int16_t x1, y1;
@@ -327,8 +380,7 @@ void updateTuningDisplay(float freq, const String& note, int cents, int stringNu
     tft.getTextBounds(note.c_str(), 0, 0, &x1, &y1, &w, &h);
     tft.setCursor((320 - w) / 2, 90);
     tft.print(note);
-    
-    // Frequency below note - centered
+
     tft.setTextSize(2);
     tft.setTextColor(COLOR_TEXT_DIM);
     char freqStr[16];
@@ -337,7 +389,6 @@ void updateTuningDisplay(float freq, const String& note, int cents, int stringNu
     tft.setCursor((320 - w) / 2, 140);
     tft.print(freqStr);
   } else {
-    // No signal - show placeholder
     tft.setTextSize(4);
     tft.setTextColor(COLOR_TEXT_DIM);
     int16_t x1, y1;
@@ -346,13 +397,11 @@ void updateTuningDisplay(float freq, const String& note, int cents, int stringNu
     tft.setCursor((320 - w) / 2, 100);
     tft.print("---");
   }
-  
-  // Cents meter
+
   drawCentsMeter(175, cents);
-  
-  // Status text - clear and redraw
+
   tft.fillRect(0, 220, 320, 20, COLOR_BG);
-  
+
   if (freq <= 0) {
     drawCenteredText("Play a string", 222, 2, COLOR_TEXT_DIM);
   } else if (abs(cents) <= TUNE_TOLERANCE) {
@@ -367,21 +416,21 @@ void updateTuningDisplay(float freq, const String& note, int cents, int stringNu
 
 void drawAutoTuneAllScreen() {
   tft.fillScreen(COLOR_BG);
-  
+
   drawCenteredText("AUTO TUNE", 20, 3, COLOR_PRIMARY);
-  
+
   int boxSize = 40;
   int spacing = 10;
   int totalWidth = 6 * boxSize + 5 * spacing;
   int startX = (320 - totalWidth) / 2;
   int y = 70;
-  
+
   for (int i = 0; i < 6; i++) {
     int x = startX + i * (boxSize + spacing);
-    
+
     uint16_t bgColor = COLOR_CARD;
     uint16_t textColor = COLOR_TEXT_DIM;
-    
+
     if (i < autoTuneCurrentString) {
       bgColor = COLOR_SUCCESS;
       textColor = COLOR_BG;
@@ -389,7 +438,7 @@ void drawAutoTuneAllScreen() {
       bgColor = COLOR_WARNING;
       textColor = COLOR_BG;
     }
-    
+
     tft.fillRoundRect(x, y, boxSize, boxSize, 6, bgColor);
     tft.setTextSize(2);
     tft.setTextColor(textColor);
@@ -399,7 +448,7 @@ void drawAutoTuneAllScreen() {
     tft.setCursor(x + (boxSize - w) / 2, y + (boxSize - h) / 2);
     tft.print(STRING_NAMES[i]);
   }
-  
+
   if (autoTuneCurrentString < 6) {
     tft.fillRoundRect(40, 130, 240, 50, 8, COLOR_CARD);
     tft.setTextSize(1);
@@ -414,61 +463,64 @@ void drawAutoTuneAllScreen() {
     tft.print((int)tuningModes[tuningMode].freqs[autoTuneCurrentString]);
     tft.print(" Hz");
   }
+
+  drawCentsMeter(210, 0);
 }
 
 void updateAutoTuneDisplay(float freq, int cents) {
-  tft.fillRect(40, 190, 240, 45, COLOR_BG);
-  
+  tft.fillRect(0, 190, 320, 20, COLOR_BG);
+
+  drawCentsMeter(210, freq > 0 ? cents : 0);
+
   if (freq > 0) {
     char buf[32];
     sprintf(buf, "%d Hz (%s%d)", (int)freq, cents > 0 ? "+" : "", cents);
-    drawCenteredText(buf, 195, 2, COLOR_TEXT);
-    drawCentsMeter(210, cents);
+    drawCenteredText(buf, 192, 2, COLOR_TEXT);
   } else {
-    drawCenteredText("Waiting...", 200, 2, COLOR_TEXT_DIM);
+    drawCenteredText("---", 192, 2, COLOR_TEXT_DIM);
   }
 }
 
 void drawStringSelectScreen() {
   tft.fillScreen(COLOR_BG);
-  
+
   drawCenteredText("SELECT STRING", 20, 2, COLOR_PRIMARY);
-  
+
   int boxWidth = 90;
   int boxHeight = 45;
   int spacing = 15;
   int startY = 60;
-  
+
   bool autoSelected = isAutoMode;
   tft.fillRoundRect(115, startY, 90, 35, 6, autoSelected ? COLOR_PRIMARY : COLOR_CARD);
   tft.setTextSize(2);
   tft.setTextColor(autoSelected ? COLOR_BG : COLOR_TEXT);
   tft.setCursor(135, startY + 10);
   tft.print("AUTO");
-  
+
   startY = 110;
   for (int i = 0; i < 6; i++) {
     int col = i % 3;
     int row = i / 3;
     int x = 25 + col * (boxWidth + spacing);
     int y = startY + row * (boxHeight + spacing);
-    
+
     bool selected = (!isAutoMode && selectedString == i);
-    
+
     tft.fillRoundRect(x, y, boxWidth, boxHeight, 6, selected ? COLOR_PRIMARY : COLOR_CARD);
-    
+
     tft.setTextSize(2);
     tft.setTextColor(selected ? COLOR_BG : COLOR_TEXT);
     tft.setCursor(x + 25, y + 8);
     tft.print(STRING_NAMES[i]);
-    
+
     tft.setTextSize(1);
     tft.setTextColor(selected ? COLOR_BG : COLOR_TEXT_DIM);
     tft.setCursor(x + 20, y + 30);
     tft.print((int)tuningModes[tuningMode].freqs[i]);
     tft.print(" Hz");
   }
-  
+
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
   tft.setCursor(60, 225);
@@ -477,25 +529,25 @@ void drawStringSelectScreen() {
 
 void drawModeSelectScreen() {
   tft.fillScreen(COLOR_BG);
-  
+
   drawCenteredText("TUNING MODE", 20, 2, COLOR_PRIMARY);
-  
+
   int boxHeight = 40;
   int spacing = 10;
   int startY = 60;
-  
+
   for (int i = 0; i < 4; i++) {
     int y = startY + i * (boxHeight + spacing);
     bool selected = (tuningMode == i);
-    
+
     tft.fillRoundRect(30, y, 260, boxHeight, 6, selected ? COLOR_PRIMARY : COLOR_CARD);
-    
+
     tft.setTextSize(2);
     tft.setTextColor(selected ? COLOR_BG : COLOR_TEXT);
     tft.setCursor(50, y + 12);
     tft.print(tuningModes[i].name);
   }
-  
+
   tft.setTextSize(1);
   tft.setTextColor(COLOR_TEXT_DIM);
   tft.setCursor(60, 225);
@@ -504,18 +556,18 @@ void drawModeSelectScreen() {
 
 void drawSuccessAnimation() {
   if (!showSuccessAnimation) return;
-  
+
   int centerX = 160;
   int centerY = 120;
-  
+
   int size = 40 + (successAnimationFrame % 20);
   tft.fillCircle(centerX, centerY, size, COLOR_SUCCESS);
-  
+
   tft.drawLine(centerX - 15, centerY, centerX - 5, centerY + 15, COLOR_TEXT);
   tft.drawLine(centerX - 5, centerY + 15, centerX + 20, centerY - 15, COLOR_TEXT);
   tft.drawLine(centerX - 14, centerY, centerX - 5, centerY + 14, COLOR_TEXT);
   tft.drawLine(centerX - 5, centerY + 14, centerX + 19, centerY - 15, COLOR_TEXT);
-  
+
   successAnimationFrame++;
 }
 
@@ -529,25 +581,25 @@ void initButtons() {
 int readButtonPress(int buttonIndex, int pin) {
   bool currentState = digitalRead(pin);
   int result = 0;
-  
+
   if (currentState == LOW && lastButtonState[buttonIndex] == HIGH) {
     buttonPressStart[buttonIndex] = millis();
     buttonLongPressTriggered[buttonIndex] = false;
   }
-  
+
   if (currentState == HIGH && lastButtonState[buttonIndex] == LOW) {
     unsigned long duration = millis() - buttonPressStart[buttonIndex];
-    
+
     if (!buttonLongPressTriggered[buttonIndex]) {
       if (duration >= 2000) result = 3;
       else if (duration >= 800) result = 2;
       else if (duration >= 50) result = 1;
     }
   }
-  
+
   if (currentState == LOW && !buttonLongPressTriggered[buttonIndex]) {
     unsigned long duration = millis() - buttonPressStart[buttonIndex];
-    
+
     if (duration >= 2000) {
       buttonLongPressTriggered[buttonIndex] = true;
       result = 3;
@@ -556,7 +608,7 @@ int readButtonPress(int buttonIndex, int pin) {
       result = 2;
     }
   }
-  
+
   lastButtonState[buttonIndex] = currentState;
   return result;
 }
@@ -564,7 +616,7 @@ int readButtonPress(int buttonIndex, int pin) {
 void handleButtons() {
   int toggleAction = readButtonPress(0, BTN_TOGGLE);
   int selectAction = readButtonPress(1, BTN_SELECT);
-  
+
   if (toggleAction > 0) {
     if (toggleAction == 3) {
       currentState = STATE_OFF;
@@ -576,7 +628,7 @@ void handleButtons() {
         tunerServo.detach();
         servoAttached = false;
       }
-      
+
     } else if (toggleAction == 2) {
       if (currentState == STATE_STANDBY) {
         currentState = STATE_AUTO_TUNE_ALL;
@@ -590,12 +642,12 @@ void handleButtons() {
         }
         drawAutoTuneAllScreen();
       }
-      
+
     } else if (toggleAction == 1) {
       if (currentState == STATE_OFF) {
         currentState = STATE_STANDBY;
         drawStandbyScreen();
-        
+
       } else if (currentState == STATE_STANDBY) {
         currentState = STATE_TUNING;
         drawTuningScreen();
@@ -604,7 +656,7 @@ void handleButtons() {
           tunerServo.attach(SERVO_PIN, 500, 2500);
           servoAttached = true;
         }
-        
+
       } else if (currentState == STATE_TUNING || currentState == STATE_AUTO_TUNE_ALL) {
         currentState = STATE_STANDBY;
         autoTuneInProgress = false;
@@ -617,30 +669,30 @@ void handleButtons() {
           servoAttached = false;
         }
         drawStandbyScreen();
-        
+
       } else if (currentState == STATE_STRING_SELECT || currentState == STATE_MODE_SELECT) {
         currentState = STATE_STANDBY;
         drawStandbyScreen();
-        
+
       } else {
         currentState = STATE_STANDBY;
         drawStandbyScreen();
       }
     }
   }
-  
+
   if (selectAction > 0) {
     if (selectAction == 2) {
       if (currentState == STATE_STANDBY) {
         currentState = STATE_MODE_SELECT;
         drawModeSelectScreen();
       }
-      
+
     } else if (selectAction == 1) {
       if (currentState == STATE_STANDBY) {
         currentState = STATE_STRING_SELECT;
         drawStringSelectScreen();
-        
+
       } else if (currentState == STATE_STRING_SELECT) {
         if (isAutoMode) {
           isAutoMode = false;
@@ -653,7 +705,7 @@ void handleButtons() {
           }
         }
         drawStringSelectScreen();
-        
+
       } else if (currentState == STATE_MODE_SELECT) {
         tuningMode = (tuningMode + 1) % 4;
         drawModeSelectScreen();
@@ -666,20 +718,20 @@ void handleButtons() {
 
 int identifyString(float f) {
   if (f <= 0) return -1;
-  
+
   if (currentState == STATE_AUTO_TUNE_ALL && autoTuneInProgress) {
     return autoTuneCurrentString;
   }
-  
+
   if (!isAutoMode) return selectedString;
-  
+
   int best = -1;
   float bestDiff = 1e9;
   float* targetFreqs = tuningModes[tuningMode].freqs;
-  
+
   for (int i = 0; i < 6; i++) {
     float diff = fabsf(f - targetFreqs[i]);
-    if (diff < targetFreqs[i] * 0.26f && diff < bestDiff) {
+    if (diff < targetFreqs[i] * 0.30f && diff < bestDiff) {
       bestDiff = diff;
       best = i;
     }
@@ -689,13 +741,13 @@ int identifyString(float f) {
 
 void freqToNote(float f, String &name, int &cents) {
   if (f <= 0) { name = "--"; cents = 0; return; }
-  
+
   float midi = 69.0f + 12.0f * log2f(f / 440.0f);
   int noteNum = roundf(midi);
   int idx = noteNum % 12;
   if (idx < 0) idx += 12;
   name = NOTE_NAMES[idx];
-  
+
   int stringNum = identifyString(f);
   if (stringNum >= 0) {
     float targetFreq = tuningModes[tuningMode].freqs[stringNum];
@@ -725,40 +777,43 @@ void detachServoIfNeeded() {
 
 void updateServoFromCents(int cents) {
   if (currentState != STATE_TUNING && currentState != STATE_AUTO_TUNE_ALL) return;
-  
+
   unsigned long now = millis();
-  
-  // INSTANT SUCCESS: If within tolerance, immediately trigger success!
+
   if (abs(cents) <= TUNE_TOLERANCE) {
-    servoIsMoving = false;
-    showSuccessAnimation = true;
-    successAnimationFrame = 0;
-    successAnimationStartTime = millis();
-    
-    Serial.printf("IN TUNE! (%d cents)\n", cents);
-    targetServoPos = servoPos;
-    lastCents = cents;
-    return;
-  }
-  
-  // Check timeout for auto tune all
-  if (currentState == STATE_AUTO_TUNE_ALL && millis() - autoTuneStringStartTime > AUTO_TUNE_TIMEOUT) {
-    Serial.println("Timeout - skipping");
-    autoTuneCurrentString++;
-    
-    if (autoTuneCurrentString >= 6) {
-      currentState = STATE_STANDBY;
-      autoTuneInProgress = false;
-      drawStandbyScreen();
+    if (!wasInTune) {
+      inTuneStartTime = now;
+      wasInTune = true;
+      Serial.println("Entered in-tune zone...");
     } else {
-      autoTuneStringStartTime = millis();
-      currentTuneStartTime = millis();
-      drawAutoTuneAllScreen();
+      if (now - inTuneStartTime >= IN_TUNE_DURATION) {
+        servoIsMoving = false;
+        showSuccessAnimation = true;
+        successAnimationFrame = 0;
+        successAnimationStartTime = now;
+        wasInTune = false;
+
+        Serial.printf("IN TUNE! (held for %lums at %d cents)\n", IN_TUNE_DURATION, cents);
+        targetServoPos = servoPos;
+        lastCents = cents;
+        return;
+      }
+      static unsigned long lastProgressPrint = 0;
+      if (now - lastProgressPrint > 100) {
+        unsigned long elapsed = now - inTuneStartTime;
+        Serial.printf("In zone: %lu/%lu ms\n", elapsed, IN_TUNE_DURATION);
+        lastProgressPrint = now;
+      }
     }
     return;
+  } else {
+    if (wasInTune) {
+      Serial.println("Left in-tune zone - resetting");
+    }
+    wasInTune = false;
+    inTuneStartTime = 0;
   }
-  
-  // Wait for servo to finish moving before next adjustment
+
   if (servoIsMoving) {
     if (now - servoMoveStartTime < SERVO_MOVE_DURATION) {
       return;
@@ -766,27 +821,25 @@ void updateServoFromCents(int cents) {
       servoIsMoving = false;
     }
   }
-  
+
   if (now - lastServoMove < SERVO_MOVE_PERIOD) return;
-  
-  // Calculate step size based on how far off we are
+
   int step = 1;
   int absCents = abs(cents);
-  
+
   if (absCents > 30) step = 5;
   else if (absCents > 20) step = 3;
   else if (absCents > 10) step = 2;
   else step = 1;
-  
-  // Move servo in correct direction
+
   if (cents < 0) {
     targetServoPos = servoPos + step;
   } else {
     targetServoPos = servoPos - step;
   }
-  
+
   targetServoPos = constrain(targetServoPos, 0, 180);
-  
+
   if (targetServoPos != servoPos) {
     attachServoIfNeeded();
     tunerServo.write(targetServoPos);
@@ -795,7 +848,7 @@ void updateServoFromCents(int cents) {
     servoMoveStartTime = now;
     lastServoMove = now;
   }
-  
+
   lastCents = cents;
 }
 
@@ -803,10 +856,11 @@ void checkSuccessAnimationComplete() {
   if (showSuccessAnimation && (millis() - successAnimationStartTime >= SUCCESS_DISPLAY_TIME)) {
     showSuccessAnimation = false;
     successAnimationFrame = 0;
-    
+    wasInTune = false;
+
     if (currentState == STATE_AUTO_TUNE_ALL) {
       autoTuneCurrentString++;
-      
+
       if (autoTuneCurrentString >= 6) {
         currentState = STATE_STANDBY;
         autoTuneInProgress = false;
@@ -818,29 +872,16 @@ void checkSuccessAnimationComplete() {
           servoAttached = false;
         }
         drawStandbyScreen();
+        Serial.println("AUTO TUNE ALL COMPLETE!");
       } else {
         autoTuneStringStartTime = millis();
         currentTuneStartTime = millis();
         drawAutoTuneAllScreen();
+        Serial.printf("Next string: %s\n", STRING_NAMES[autoTuneCurrentString]);
       }
     } else if (currentState == STATE_TUNING) {
-      if (!isAutoMode && selectedString < 5) {
-        selectedString++;
-        currentTuneStartTime = millis();
-        drawTuningScreen();
-      } else if (!isAutoMode && selectedString >= 5) {
-        currentState = STATE_STANDBY;
-        if (servoAttached) {
-          servoPos = 90;
-          tunerServo.write(servoPos);
-          delay(200);
-          tunerServo.detach();
-          servoAttached = false;
-        }
-        drawStandbyScreen();
-      } else {
-        drawTuningScreen();
-      }
+      drawTuningScreen();
+      Serial.println("String tuned, ready for next.");
     }
   }
 }
@@ -850,9 +891,8 @@ void checkSuccessAnimationComplete() {
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== GUITAR TUNER v3.0 (Autocorrelation) ===\n");
+  Serial.println("\n=== GUITAR TUNER v3.3 (freq aware autocorrelation) ===\n");
 
-  // Allocate sample buffer
   sampleBuffer = (int16_t*)malloc(SAMPLES * sizeof(int16_t));
   if (!sampleBuffer) {
     Serial.println("Memory allocation failed!");
@@ -860,7 +900,7 @@ void setup() {
   }
 
   analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
+  analogSetAttenuation(ADC_6db);   // higher gain than 11db, better for high strings
 
   SPI.begin(TFT_CLK, -1, TFT_MOSI, TFT_CS);
   delay(100);
@@ -873,7 +913,7 @@ void setup() {
   tft.sendCommand(ST77XX_MADCTL, &madctl, 1);
 
   tft.fillScreen(COLOR_BG);
-  
+
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
 
@@ -886,48 +926,60 @@ void setup() {
   tunerServo.setPeriodHertz(50);
 
   drawStandbyScreen();
-  
-  Serial.println("Ready! Using autocorrelation for pitch detection.");
+
+  Serial.println("Ready, using freq aware autocorrelation.");
 }
 
 // ===== MAIN LOOP =====
 
 void loop() {
   handleButtons();
-  
+
   if (currentState == STATE_TUNING || currentState == STATE_AUTO_TUNE_ALL) {
     attachServoIfNeeded();
     checkSuccessAnimationComplete();
-    
+
     if (!showSuccessAnimation) {
-      // Capture and detect pitch
+      // figure out expected freq for this capture
+      float expected = -1.0f;
+      if (currentState == STATE_AUTO_TUNE_ALL) {
+        expected = tuningModes[tuningMode].freqs[autoTuneCurrentString];
+      } else if (currentState == STATE_TUNING && !isAutoMode && selectedString >= 0) {
+        expected = tuningModes[tuningMode].freqs[selectedString];
+      }
+
       captureSamples();
-      float freq = detectPitchAutocorrelation();
-      
-      // Hold last valid frequency briefly after signal drops
+      float freq = detectPitchAutocorrelation(expected);
+
+      // extra sanity clamp
+      if (expected > 0 && freq > 0) {
+        if (freq < expected * 0.5f || freq > expected * 1.8f) {
+          freq = 0.0f;
+        }
+      }
+
       if (freq > 0) {
         lastValidFreq = freq;
         lastValidTime = millis();
       } else if (millis() - lastValidTime < HOLD_TIME) {
         freq = lastValidFreq;
       }
-      
+
       String note = "--";
       int cents = 0;
       int stringNum = -1;
-      
+
       if (freq > 0) {
         freqToNote(freq, note, cents);
         stringNum = identifyString(freq);
-        
+
         if (stringNum >= 0) {
           updateServoFromCents(cents);
         }
-        
-        // Debug output
+
         static unsigned long lastPrint = 0;
         if (millis() - lastPrint > 200) {
-          Serial.printf("Freq: %.1f Hz | Note: %s | Cents: %d | Signal: %.0f\n", 
+          Serial.printf("Freq: %.1f Hz | Note: %s | Cents: %d | Signal: %.0f\n",
                         freq, note.c_str(), cents, signalLevel);
           lastPrint = millis();
         }
@@ -939,12 +991,12 @@ void loop() {
         updateAutoTuneDisplay(freq, cents);
       }
     }
-    
+
     if (showSuccessAnimation) {
       drawSuccessAnimation();
     }
-    
-    delay(10);  // Faster loop with autocorrelation
+
+    delay(10);
     yield();
   } else {
     detachServoIfNeeded();
